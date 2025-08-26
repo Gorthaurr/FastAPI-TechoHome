@@ -1,0 +1,15 @@
+{
+  "modes": [
+    {
+      "name": "Shrimp Planner",
+      "model": "gpt-5",
+      "allowedMcpTools": ["mcp_shrimp_task_manager_plan_task"]
+    },
+    {
+      "name": "Shrimp Executor",
+      "model": "gpt-5",
+      "allowedMcpTools": ["mcp_shrimp_task_manager_execute_task"]
+    }
+  ]
+}
+

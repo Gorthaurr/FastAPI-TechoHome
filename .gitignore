@@ -1,0 +1,11 @@
+# Environment files
+.env
+.env.*
+!.env.example
+
+# Python cache/temp files
+__pycache__/
+*.py[cod]
+*$py.class
+
+
