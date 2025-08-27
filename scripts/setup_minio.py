@@ -5,20 +5,27 @@ Setup MinIO bucket for migration.
 
 import boto3
 import os
+import sys
+
+# Add project path
+project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.append(project_root)
+
+from app.core.config import settings
 
 def main():
     print("=== SETTING UP MINIO BUCKET ===")
     
     try:
-        # Create S3 client
+        # Create S3 client using settings from .env
         s3 = boto3.client(
             's3',
-            endpoint_url='http://localhost:9000',
-            aws_access_key_id='minioadmin',
-            aws_secret_access_key='minioadmin'
+            endpoint_url=settings.S3_ENDPOINT_URL or 'http://localhost:9000',
+            aws_access_key_id=os.getenv('AWS_ACCESS_KEY_ID', 'minioadmin'),
+            aws_secret_access_key=os.getenv('AWS_SECRET_ACCESS_KEY', 'minioadmin')
         )
         
-        bucket_name = 'product-images'
+        bucket_name = settings.S3_BUCKET_NAME or 'product-images'
         
         # Check if bucket exists
         try:

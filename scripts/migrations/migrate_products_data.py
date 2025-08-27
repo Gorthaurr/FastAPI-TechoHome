@@ -223,6 +223,92 @@ class ProductDataMigrationService:
         logger.info(f"Backup saved to {backup_path}")
         return str(backup_path)
     
+    def migrate_from_local_db(self) -> None:
+        """Migrate data from local database to Docker database."""
+        logger.info("Starting migration from local database...")
+        
+        # Local database connection
+        local_engine = create_engine("postgresql+psycopg2://postgres:Anton533@localhost:5432/Shop")
+        LocalSession = sessionmaker(autocommit=False, autoflush=False, bind=local_engine)
+        local_session = LocalSession()
+        
+        try:
+            # Migrate categories
+            logger.info("Migrating categories...")
+            local_categories = local_session.execute(text("SELECT id, slug FROM categories")).fetchall()
+            for category in local_categories:
+                self.db_session.execute(
+                    text("INSERT INTO categories (id, slug) VALUES (:id, :slug) ON CONFLICT (id) DO NOTHING"),
+                    {"id": category.id, "slug": category.slug}
+                )
+            self.db_session.commit()
+            logger.info(f"Migrated {len(local_categories)} categories")
+            
+            # Migrate products
+            logger.info("Migrating products...")
+            local_products = local_session.execute(text("""
+                SELECT id, name, description, price_raw, price_cents, category_id, product_url 
+                FROM products
+            """)).fetchall()
+            for product in local_products:
+                self.db_session.execute(text("""
+                    INSERT INTO products (id, name, description, price_raw, price_cents, category_id, product_url) 
+                    VALUES (:id, :name, :description, :price_raw, :price_cents, :category_id, :product_url) 
+                    ON CONFLICT (id) DO NOTHING
+                """), {
+                    "id": product.id, "name": product.name, "description": product.description,
+                    "price_raw": product.price_raw, "price_cents": product.price_cents,
+                    "category_id": product.category_id, "product_url": product.product_url
+                })
+            self.db_session.commit()
+            logger.info(f"Migrated {len(local_products)} products")
+            
+            # Migrate product images
+            logger.info("Migrating product images...")
+            local_images = local_session.execute(text("""
+                SELECT id, product_id, path, filename, sort_order, is_primary, status
+                FROM product_images
+            """)).fetchall()
+            for image in local_images:
+                self.db_session.execute(text("""
+                    INSERT INTO product_images (id, product_id, path, filename, sort_order, is_primary, status) 
+                    VALUES (:id, :product_id, :path, :filename, :sort_order, :is_primary, :status) 
+                    ON CONFLICT (id) DO NOTHING
+                """), {
+                    "id": image.id, "product_id": image.product_id, "path": image.path,
+                    "filename": image.filename, "sort_order": image.sort_order,
+                    "is_primary": image.is_primary, "status": image.status
+                })
+            self.db_session.commit()
+            logger.info(f"Migrated {len(local_images)} product images")
+            
+            # Migrate product attributes
+            logger.info("Migrating product attributes...")
+            local_attributes = local_session.execute(text("""
+                SELECT id, product_id, key, value
+                FROM product_attributes
+            """)).fetchall()
+            for attr in local_attributes:
+                self.db_session.execute(text("""
+                    INSERT INTO product_attributes (id, product_id, attr_key, value) 
+                    VALUES (:id, :product_id, :attr_key, :value) 
+                    ON CONFLICT (id) DO NOTHING
+                """), {
+                    "id": attr.id, "product_id": attr.product_id, 
+                    "attr_key": attr.key, "value": attr.value
+                })
+            self.db_session.commit()
+            logger.info(f"Migrated {len(local_attributes)} product attributes")
+            
+            logger.info("Migration completed successfully!")
+            
+        except Exception as e:
+            logger.error(f"Migration error: {e}")
+            self.db_session.rollback()
+            raise
+        finally:
+            local_session.close()
+    
     def run_analysis(self) -> None:
         """Run complete data analysis."""
         logger.info("Starting products data analysis")
@@ -245,26 +331,59 @@ class ProductDataMigrationService:
 
 
 def main():
-    print("=== PRODUCTS DATA ANALYSIS ===")
-    print("This script analyzes current product data and creates backup.")
+    print("=== PRODUCTS DATA MIGRATION ===")
+    print("This script can analyze data or migrate from local database.")
     print()
-    print("What it does:")
-    print("1. Generates data summary report")
-    print("2. Validates data integrity")
-    print("3. Creates backup of current data")
-    print("4. Provides recommendations")
+    print("Options:")
+    print("1. Analyze current data (creates backup)")
+    print("2. Migrate data from local database")
     print()
     
-    response = input("Continue analysis? (y/N): ")
-    if response.lower() != 'y':
-        print("Analysis cancelled")
-        return
+    choice = input("Choose option (1/2): ")
     
     try:
         migration_service = ProductDataMigrationService()
-        migration_service.run_analysis()
+        
+        if choice == "1":
+            print("=== PRODUCTS DATA ANALYSIS ===")
+            print("This script analyzes current product data and creates backup.")
+            print()
+            print("What it does:")
+            print("1. Generates data summary report")
+            print("2. Validates data integrity")
+            print("3. Creates backup of current data")
+            print("4. Provides recommendations")
+            print()
+            
+            response = input("Continue analysis? (y/N): ")
+            if response.lower() != 'y':
+                print("Analysis cancelled")
+                return
+            
+            migration_service.run_analysis()
+            
+        elif choice == "2":
+            print("=== MIGRATION FROM LOCAL DATABASE ===")
+            print("This will migrate data from local PostgreSQL to Docker PostgreSQL.")
+            print()
+            print("What it does:")
+            print("1. Connects to local database (localhost:5432/Shop)")
+            print("2. Migrates categories, products, and product images")
+            print("3. Preserves all relationships")
+            print()
+            
+            response = input("Continue migration? (y/N): ")
+            if response.lower() != 'y':
+                print("Migration cancelled")
+                return
+            
+            migration_service.migrate_from_local_db()
+            
+        else:
+            print("Invalid choice. Please select 1 or 2.")
+            
     except Exception as e:
-        logger.error(f"Analysis startup error: {e}")
+        logger.error(f"Operation error: {e}")
         sys.exit(1)
 
 

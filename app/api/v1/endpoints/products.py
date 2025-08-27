@@ -100,7 +100,6 @@ def list_products(
             "id": product.id,
             "category_id": product.category_id,
             "name": product.name,
-            "product_url": product.product_url,
             "price_raw": product.price_raw,
             "price_cents": product.price_cents,
             "description": product.description,
@@ -149,7 +148,7 @@ def list_products(
 
 @router.get("/{product_id}", response_model=dict)
 def get_product(
-    product_id: int,
+    product_id: str,
     db: Session = Depends(get_db),
     include_images: bool = Query(False, description="Включить изображения"),
     include_attributes: bool = Query(False, description="Включить атрибуты"),
@@ -184,7 +183,6 @@ def get_product(
         "id": product.id,
         "category_id": product.category_id,
         "name": product.name,
-        "product_url": product.product_url,
         "price_raw": product.price_raw,
         "price_cents": product.price_cents,
         "description": product.description,
