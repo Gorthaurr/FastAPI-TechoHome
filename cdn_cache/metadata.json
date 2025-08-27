@@ -1,0 +1,14 @@
+{
+  "files": {
+    "test-image.txt": {
+      "cached_at": "2025-08-26T19:50:42.881193",
+      "size": 80,
+      "content_type": null,
+      "version": "8611600f"
+    }
+  },
+  "stats": {
+    "hits": 0,
+    "misses": 3
+  }
+}

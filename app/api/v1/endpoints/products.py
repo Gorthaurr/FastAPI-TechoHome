@@ -11,6 +11,7 @@ from app.db.database import get_db
 from app.db.models import Product
 from app.core.config import settings
 from app.schemas.pagination import PageMeta
+from app.services.image_service import image_service
 
 
 router = APIRouter()
@@ -92,7 +93,6 @@ def list_products(
     rows = db.scalars(stmt.offset(offset).limit(page_size)).all()
 
     # Формирование ответа
-    cdn = settings.CDN_BASE_URL.rstrip("/") if settings.CDN_BASE_URL else None
     items: List[Dict[str, Any]] = []
     
     for product in rows:
@@ -112,13 +112,25 @@ def list_products(
                 product.images,
                 key=lambda x: (not x.is_primary, x.sort_order, x.id)
             )
-            item["images"] = [{
-                "id": img.id,
-                "path": img.path,
-                "sort_order": img.sort_order,
-                "is_primary": img.is_primary,
-                "url": (f"{cdn}/{img.path.lstrip('/')}" if cdn else None),
-            } for img in images]
+            item["images"] = []
+            for img in images:
+                urls = image_service.generate_urls(img.path)
+                image_data = {
+                    "id": img.id,
+                    "path": img.path,
+                    "filename": img.filename,
+                    "sort_order": img.sort_order,
+                    "is_primary": img.is_primary,
+                    "status": img.status,
+                    "url": urls.get('original'),
+                    "urls": urls,
+                    "file_size": img.file_size,
+                    "mime_type": img.mime_type,
+                    "width": img.width,
+                    "height": img.height,
+                    "alt_text": img.alt_text,
+                }
+                item["images"].append(image_data)
             
         # Добавление атрибутов
         if include_attributes:
@@ -137,7 +149,7 @@ def list_products(
 
 @router.get("/{product_id}", response_model=dict)
 def get_product(
-    product_id: str,
+    product_id: int,
     db: Session = Depends(get_db),
     include_images: bool = Query(False, description="Включить изображения"),
     include_attributes: bool = Query(False, description="Включить атрибуты"),
@@ -168,7 +180,6 @@ def get_product(
         raise HTTPException(404, detail="product not found")
 
     # Формирование ответа
-    cdn = settings.CDN_BASE_URL.rstrip("/") if settings.CDN_BASE_URL else None
     item: Dict[str, Any] = {
         "id": product.id,
         "category_id": product.category_id,
@@ -185,13 +196,25 @@ def get_product(
             product.images,
             key=lambda x: (not x.is_primary, x.sort_order, x.id)
         )
-        item["images"] = [{
-            "id": img.id,
-            "path": img.path,
-            "sort_order": img.sort_order,
-            "is_primary": img.is_primary,
-            "url": (f"{cdn}/{img.path.lstrip('/')}" if cdn else None),
-        } for img in images]
+        item["images"] = []
+        for img in images:
+            urls = image_service.generate_urls(img.path)
+            image_data = {
+                "id": img.id,
+                "path": img.path,
+                "filename": img.filename,
+                "sort_order": img.sort_order,
+                "is_primary": img.is_primary,
+                "status": img.status,
+                "url": urls.get('original'),
+                "urls": urls,
+                "file_size": img.file_size,
+                "mime_type": img.mime_type,
+                "width": img.width,
+                "height": img.height,
+                "alt_text": img.alt_text,
+            }
+            item["images"].append(image_data)
         
     # Добавление атрибутов
     if include_attributes:

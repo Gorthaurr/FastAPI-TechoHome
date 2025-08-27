@@ -30,6 +30,38 @@ class Settings(BaseSettings):
         default=False,
         description="Режим отладки"
     )
+    
+    # Настройки хранилища изображений
+    STORAGE_TYPE: str = Field(
+        default="local",
+        description="Тип хранилища: local/s3"
+    )
+    STORAGE_PATH: str = Field(
+        default="uploads",
+        description="Путь для локального хранения файлов"
+    )
+    MAX_IMAGE_SIZE: int = Field(
+        default=10 * 1024 * 1024,  # 10MB
+        description="Максимальный размер изображения в байтах"
+    )
+    ALLOWED_IMAGE_TYPES: str = Field(
+        default="jpg,jpeg,png,webp,gif",
+        description="Разрешенные типы изображений (через запятую)"
+    )
+    
+    # Настройки S3 (опционально)
+    S3_BUCKET_NAME: str = Field(
+        default="",
+        description="Имя S3 bucket для хранения файлов"
+    )
+    AWS_REGION: str = Field(
+        default="us-east-1",
+        description="AWS регион для S3"
+    )
+    S3_ENDPOINT_URL: str = Field(
+        default="",
+        description="Кастомный endpoint URL для S3 (для MinIO и т.д.)"
+    )
 
     class Config:
         env_file = ".env"

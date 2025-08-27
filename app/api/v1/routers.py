@@ -5,7 +5,7 @@
 """
 
 from fastapi import APIRouter
-from app.api.v1.endpoints import products, orders, categories, debug
+from app.api.v1.endpoints import products, orders, categories, debug, images, cdn
 
 
 # Создание основного роутера API v1
@@ -15,4 +15,6 @@ api_router = APIRouter()
 api_router.include_router(products.router, prefix="/products", tags=["products"])
 api_router.include_router(orders.router, prefix="/orders", tags=["orders"])
 api_router.include_router(categories.router, prefix="/categories", tags=["categories"])
+api_router.include_router(images.router, prefix="/images", tags=["images"])
+api_router.include_router(cdn.router, prefix="/cdn", tags=["cdn"])
 api_router.include_router(debug.router, prefix="/_debug", tags=["_debug"])

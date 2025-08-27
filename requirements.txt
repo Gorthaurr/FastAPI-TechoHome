@@ -4,3 +4,8 @@ sqlalchemy
 psycopg2-binary
 pydantic
 pydantic-settings
+pillow
+python-multipart
+boto3
+aiofiles
+python-dotenv
