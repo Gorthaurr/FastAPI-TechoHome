@@ -140,9 +140,12 @@ def list_products(
             
         items.append(item)
 
+    meta_data = PageMeta.create(page=page, page_size=page_size, total=total).model_dump()
+    print(f"🔍 Products API Meta: {meta_data}")
+    
     return {
         "items": items,
-        "meta": PageMeta(page=page, page_size=page_size, total=total).model_dump(),
+        "meta": meta_data,
     }
 
 
