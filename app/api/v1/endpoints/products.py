@@ -12,6 +12,7 @@ from app.db.models import Product
 from app.core.config import settings
 from app.schemas.pagination import PageMeta
 from app.services.image_service import image_service
+from app.services.storage_service import storage_service
 
 
 router = APIRouter()
@@ -113,7 +114,8 @@ def list_products(
             )
             item["images"] = []
             for img in images:
-                urls = image_service.generate_urls(img.path)
+                # Используем storage_service для генерации presigned URL
+                presigned_url = storage_service.get_file_url(img.path)
                 image_data = {
                     "id": img.id,
                     "path": img.path,
@@ -121,8 +123,8 @@ def list_products(
                     "sort_order": img.sort_order,
                     "is_primary": img.is_primary,
                     "status": img.status,
-                    "url": urls.get('original'),
-                    "urls": urls,
+                    "url": presigned_url,
+                    "urls": {"original": presigned_url},
                     "file_size": img.file_size,
                     "mime_type": img.mime_type,
                     "width": img.width,
@@ -199,7 +201,8 @@ def get_product(
         )
         item["images"] = []
         for img in images:
-            urls = image_service.generate_urls(img.path)
+            # Используем storage_service для генерации presigned URL
+            presigned_url = storage_service.get_file_url(img.path)
             image_data = {
                 "id": img.id,
                 "path": img.path,
@@ -207,8 +210,8 @@ def get_product(
                 "sort_order": img.sort_order,
                 "is_primary": img.is_primary,
                 "status": img.status,
-                "url": urls.get('original'),
-                "urls": urls,
+                "url": presigned_url,
+                "urls": {"original": presigned_url},
                 "file_size": img.file_size,
                 "mime_type": img.mime_type,
                 "width": img.width,

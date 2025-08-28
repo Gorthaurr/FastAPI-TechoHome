@@ -97,8 +97,8 @@ class S3StorageProvider(StorageProvider):
             's3',
             region_name=self.region,
             endpoint_url=endpoint_url,
-            aws_access_key_id=os.getenv('AWS_ACCESS_KEY_ID'),
-            aws_secret_access_key=os.getenv('AWS_SECRET_ACCESS_KEY')
+            aws_access_key_id=settings.AWS_ACCESS_KEY_ID,
+            aws_secret_access_key=settings.AWS_SECRET_ACCESS_KEY
         )
     
     def save_file(self, file_path: str, file_data: BinaryIO, content_type: str = None) -> bool:
@@ -160,12 +160,12 @@ class StorageService:
     
     def _create_provider(self) -> StorageProvider:
         """Создать провайдер хранилища на основе настроек."""
-        storage_type = getattr(settings, 'STORAGE_TYPE', 'local')
+        storage_type = getattr(settings, 'STORAGE_TYPE', 's3')  # По умолчанию используем S3/MinIO
         
         if storage_type == 's3':
-            bucket_name = os.getenv('S3_BUCKET_NAME', 'my-bucket')
-            region = os.getenv('AWS_REGION', 'us-east-1')
-            endpoint_url = os.getenv('S3_ENDPOINT_URL')
+            bucket_name = settings.S3_BUCKET_NAME
+            region = settings.AWS_REGION
+            endpoint_url = settings.S3_ENDPOINT_URL
             return S3StorageProvider(bucket_name, region, endpoint_url)
         else:
             base_path = getattr(settings, 'STORAGE_PATH', 'uploads')

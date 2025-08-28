@@ -51,7 +51,7 @@ class Settings(BaseSettings):
     
     # Настройки S3 (опционально)
     S3_BUCKET_NAME: str = Field(
-        default="",
+        default="product-images",
         description="Имя S3 bucket для хранения файлов"
     )
     AWS_REGION: str = Field(
@@ -59,8 +59,16 @@ class Settings(BaseSettings):
         description="AWS регион для S3"
     )
     S3_ENDPOINT_URL: str = Field(
-        default="",
+        default="http://localhost:9002",
         description="Кастомный endpoint URL для S3 (для MinIO и т.д.)"
+    )
+    AWS_ACCESS_KEY_ID: str = Field(
+        default="minioadmin",
+        description="AWS Access Key ID"
+    )
+    AWS_SECRET_ACCESS_KEY: str = Field(
+        default="minioadmin",
+        description="AWS Secret Access Key"
     )
 
     class Config:
