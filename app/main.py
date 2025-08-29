@@ -2,6 +2,7 @@
 Главный модуль FastAPI приложения TechHome Catalog API.
 
 Содержит конфигурацию приложения, middleware и роутеры.
+Обеспечивает интеграцию с хранилищем изображений и CDN.
 """
 
 from fastapi import FastAPI
@@ -14,8 +15,10 @@ from app.services.image_processor import start_image_processor, stop_image_proce
 # Создание экземпляра FastAPI приложения
 app = FastAPI(
     title="TechHome Catalog API",
-    description="API для каталога товаров с системой заказов",
-    version="1.0.0"
+    description="API для каталога товаров с системой заказов и управления изображениями",
+    version="1.0.0",
+    docs_url="/docs",
+    redoc_url="/redoc"
 )
 
 # Подключение статических файлов для локального хранилища
@@ -43,9 +46,13 @@ def healthz():
     Health check endpoint для мониторинга состояния приложения.
     
     Returns:
-        dict: Статус приложения
+        dict: Статус приложения и основные метрики
     """
-    return {"status": "ok"}
+    return {
+        "status": "ok",
+        "service": "TechHome Catalog API",
+        "version": "1.0.0"
+    }
 
 
 # Подключение API роутеров
@@ -54,11 +61,19 @@ app.include_router(api_router, prefix="/api/v1")
 
 @app.on_event("startup")
 async def startup_event():
-    """Событие запуска приложения."""
+    """
+    Событие запуска приложения.
+    
+    Инициализирует фоновые процессы и сервисы.
+    """
     await start_image_processor()
 
 
 @app.on_event("shutdown")
 async def shutdown_event():
-    """Событие завершения приложения."""
+    """
+    Событие завершения приложения.
+    
+    Корректно останавливает фоновые процессы и освобождает ресурсы.
+    """
     await stop_image_processor()

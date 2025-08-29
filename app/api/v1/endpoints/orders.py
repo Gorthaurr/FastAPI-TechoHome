@@ -1,5 +1,8 @@
 """
 API endpoints для работы с заказами.
+
+Содержит CRUD операции для заказов с поддержкой создания,
+просмотра и управления статусами заказов.
 """
 
 import uuid
@@ -37,7 +40,7 @@ def _normalize_uuid(s: str) -> str:
     try:
         val = UUID(s)
     except Exception:
-        raise HTTPException(400, detail="order_id must be a valid UUID")
+        raise HTTPException(400, detail="Order ID must be a valid UUID")
     return str(val)
 
 
@@ -52,16 +55,24 @@ def list_orders(
     ),
 ):
     """
-    Получить список заказов с пагинацией.
+    Получить список заказов с пагинацией и фильтрацией.
+    
+    Поддерживает:
+    - Пагинацию результатов
+    - Фильтрацию по статусу заказа
+    - Подсчет количества позиций в заказе
     
     Args:
         db: Сессия базы данных
-        page: Номер страницы
-        page_size: Размер страницы
+        page: Номер страницы (начиная с 1)
+        page_size: Размер страницы (1-100)
         status: Фильтр по статусу заказа
         
     Returns:
         dict: Список заказов с метаданными пагинации
+        
+    Raises:
+        HTTPException: При некорректных параметрах запроса
     """
     # Подсчет общего количества
     count_stmt = select(func.count()).select_from(Order)
@@ -114,9 +125,19 @@ def create_order(payload: dict, db: Session = Depends(get_db)):
     """
     Создать новый заказ.
     
+    Создает заказ с указанными товарами и информацией о клиенте.
+    Автоматически рассчитывает суммы и создает позиции заказа.
+    
     Ожидает JSON:
     {
-      "customer": {"name": "...", "email": "...", "phone": "...", "address": "...", "city": "...", "postal_code": "..."},
+      "customer": {
+        "name": "...", 
+        "email": "...", 
+        "phone": "...", 
+        "address": "...", 
+        "city": "...", 
+        "postal_code": "..."
+      },
       "items": [{"product_id": "ABC123", "qty": 2}, ...],
       "comment": "...",
       "shipping_cents": 500,
@@ -131,15 +152,15 @@ def create_order(payload: dict, db: Session = Depends(get_db)):
         dict: Созданный заказ с позициями
         
     Raises:
-        HTTPException: При некорректных данных
+        HTTPException: При некорректных данных или отсутствующих товарах
     """
     if not isinstance(payload, dict):
-        raise HTTPException(400, detail="invalid body")
+        raise HTTPException(400, detail="Invalid request body")
         
     customer = payload.get("customer") or {}
     items = payload.get("items") or []
     if not items:
-        raise HTTPException(400, detail="empty items")
+        raise HTTPException(400, detail="Order must contain at least one item")
 
     currency = payload.get("currency") or "EUR"
     shipping_cents = int(payload.get("shipping_cents") or 0)
@@ -151,7 +172,7 @@ def create_order(payload: dict, db: Session = Depends(get_db)):
     product_map = {p.id: p for p in rows}
     missing = [pid for pid in product_ids if pid not in product_map]
     if missing:
-        raise HTTPException(400, detail=f"unknown product_id(s): {', '.join(missing)}")
+        raise HTTPException(400, detail=f"Unknown product ID(s): {', '.join(missing)}")
 
     # Создание заказа
     order_id = str(uuid.uuid4())
@@ -177,7 +198,7 @@ def create_order(payload: dict, db: Session = Depends(get_db)):
         product_id = str(item.get("product_id"))
         qty = int(item.get("qty") or 0)
         if qty <= 0:
-            raise HTTPException(400, detail=f"qty must be > 0 for product {product_id}")
+            raise HTTPException(400, detail=f"Quantity must be > 0 for product {product_id}")
             
         product = product_map[product_id]
         price = int(product.price_cents or 0)
@@ -237,6 +258,9 @@ def get_order(order_id: str, db: Session = Depends(get_db)):
     """
     Получить заказ по ID.
     
+    Возвращает полную информацию о заказе включая все позиции
+    и данные о клиенте.
+    
     Args:
         order_id: UUID заказа
         db: Сессия базы данных
@@ -245,7 +269,7 @@ def get_order(order_id: str, db: Session = Depends(get_db)):
         dict: Данные заказа с позициями
         
     Raises:
-        HTTPException: Если заказ не найден
+        HTTPException: Если заказ не найден или UUID некорректный
     """
     # Нормализуем и валидируем UUID
     order_id = _normalize_uuid(order_id)
@@ -256,7 +280,7 @@ def get_order(order_id: str, db: Session = Depends(get_db)):
         .where(Order.id == order_id)
     )
     if not order:
-        raise HTTPException(404, detail="order not found")
+        raise HTTPException(404, detail="Order not found")
 
     return {
         "id": order.id,
