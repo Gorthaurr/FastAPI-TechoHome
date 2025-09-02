@@ -4,71 +4,55 @@
 Содержит настройки для подключения к БД, CDN и режима отладки.
 """
 
-from pydantic_settings import BaseSettings
 from pydantic import Field
+from pydantic_settings import BaseSettings
 
 
 class Settings(BaseSettings):
     """
     Настройки приложения, загружаемые из переменных окружения.
-    
+
     Attributes:
         DATABASE_URL: URL подключения к PostgreSQL
         CDN_BASE_URL: Базовый URL CDN для изображений
         DEBUG: Режим отладки
     """
-    
+
     DATABASE_URL: str = Field(
         default="postgresql+psycopg2://postgres:Anton533@localhost:5432/Shop",
-        description="URL подключения к PostgreSQL"
+        description="URL подключения к PostgreSQL",
     )
-    CDN_BASE_URL: str = Field(
-        default="",
-        description="Базовый URL CDN для изображений"
-    )
-    DEBUG: bool = Field(
-        default=False,
-        description="Режим отладки"
-    )
-    
+    CDN_BASE_URL: str = Field(default="", description="Базовый URL CDN для изображений")
+    DEBUG: bool = Field(default=False, description="Режим отладки")
+
     # Настройки хранилища изображений
-    STORAGE_TYPE: str = Field(
-        default="local",
-        description="Тип хранилища: local/s3"
-    )
+    STORAGE_TYPE: str = Field(default="local", description="Тип хранилища: local/s3")
     STORAGE_PATH: str = Field(
-        default="uploads",
-        description="Путь для локального хранения файлов"
+        default="uploads", description="Путь для локального хранения файлов"
     )
     MAX_IMAGE_SIZE: int = Field(
         default=10 * 1024 * 1024,  # 10MB
-        description="Максимальный размер изображения в байтах"
+        description="Максимальный размер изображения в байтах",
     )
     ALLOWED_IMAGE_TYPES: str = Field(
         default="jpg,jpeg,png,webp,gif",
-        description="Разрешенные типы изображений (через запятую)"
+        description="Разрешенные типы изображений (через запятую)",
     )
-    
+
     # Настройки S3 (опционально)
     S3_BUCKET_NAME: str = Field(
-        default="product-images",
-        description="Имя S3 bucket для хранения файлов"
+        default="product-images", description="Имя S3 bucket для хранения файлов"
     )
-    AWS_REGION: str = Field(
-        default="us-east-1",
-        description="AWS регион для S3"
-    )
+    AWS_REGION: str = Field(default="us-east-1", description="AWS регион для S3")
     S3_ENDPOINT_URL: str = Field(
         default="http://localhost:9002",
-        description="Кастомный endpoint URL для S3 (для MinIO и т.д.)"
+        description="Кастомный endpoint URL для S3 (для MinIO и т.д.)",
     )
     AWS_ACCESS_KEY_ID: str = Field(
-        default="minioadmin",
-        description="AWS Access Key ID"
+        default="minioadmin", description="AWS Access Key ID"
     )
     AWS_SECRET_ACCESS_KEY: str = Field(
-        default="minioadmin",
-        description="AWS Secret Access Key"
+        default="minioadmin", description="AWS Secret Access Key"
     )
 
     class Config:

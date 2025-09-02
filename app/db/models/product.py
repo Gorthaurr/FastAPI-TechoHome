@@ -3,15 +3,17 @@
 """
 
 from typing import List, Optional
+
+from sqlalchemy import ForeignKey, Integer, String, Text
 from sqlalchemy.orm import Mapped, mapped_column, relationship
-from sqlalchemy import Integer, String, Text, ForeignKey
+
 from .base import Base
 
 
 class Product(Base):
     """
     Модель товара.
-    
+
     Attributes:
         id: Уникальный идентификатор товара
         category_id: ID категории товара
@@ -24,14 +26,12 @@ class Product(Base):
         images: Связь с изображениями товара
         attributes: Связь с атрибутами товара
     """
-    
+
     __tablename__ = "products"
 
     id: Mapped[str] = mapped_column(String(64), primary_key=True)
     category_id: Mapped[int] = mapped_column(
-        Integer,
-        ForeignKey("categories.id", ondelete="RESTRICT"),
-        index=True
+        Integer, ForeignKey("categories.id", ondelete="RESTRICT"), index=True
     )
     product_url: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     name: Mapped[str] = mapped_column(Text)
@@ -42,12 +42,11 @@ class Product(Base):
     # Связи с другими моделями
     category: Mapped["Category"] = relationship(back_populates="products")
     images: Mapped[List["ProductImage"]] = relationship(
-        back_populates="product",
-        cascade="all,delete",
-        lazy="selectin"
+        back_populates="product", cascade="all,delete", lazy="selectin"
     )
     attributes: Mapped[List["ProductAttribute"]] = relationship(
-        back_populates="product",
-        cascade="all,delete",
-        lazy="selectin"
+        back_populates="product", cascade="all,delete", lazy="selectin"
     )
+
+    def __repr__(self) -> str:
+        return f"<Product(id='{self.id}', name='{self.name}')>"

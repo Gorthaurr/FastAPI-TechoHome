@@ -9,3 +9,14 @@ python-multipart
 boto3
 aiofiles
 python-dotenv
+pydantic[email]
+passlib[bcrypt]
+python-jose[cryptography]
+
+# Development dependencies
+black
+flake8
+mypy
+isort
+pytest
+pytest-asyncio

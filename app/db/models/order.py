@@ -3,16 +3,26 @@
 """
 
 from typing import List, Optional
-from sqlalchemy.orm import Mapped, mapped_column, relationship
-from sqlalchemy import String, Integer, Text, CheckConstraint, ForeignKey, BigInteger, text
+
+from sqlalchemy import (
+    BigInteger,
+    CheckConstraint,
+    ForeignKey,
+    Integer,
+    String,
+    Text,
+    text,
+)
 from sqlalchemy.dialects.postgresql import UUID
+from sqlalchemy.orm import Mapped, mapped_column, relationship
+
 from .base import Base
 
 
 class Order(Base):
     """
     Модель заказа.
-    
+
     Attributes:
         id: UUID заказа
         status: Статус заказа (pending/paid/canceled/shipped/completed)
@@ -31,18 +41,12 @@ class Order(Base):
         updated_at: Дата обновления
         items: Позиции заказа
     """
-    
+
     __tablename__ = "orders"
 
     id: Mapped[str] = mapped_column(UUID(as_uuid=False), primary_key=True)
-    status: Mapped[str] = mapped_column(
-        String(32),
-        server_default=text("'pending'")
-    )
-    currency: Mapped[str] = mapped_column(
-        String(3),
-        server_default=text("'EUR'")
-    )
+    status: Mapped[str] = mapped_column(String(32), server_default=text("'pending'"))
+    currency: Mapped[str] = mapped_column(String(3), server_default=text("'EUR'"))
 
     # Данные клиента
     customer_name: Mapped[str] = mapped_column(Text)
@@ -65,23 +69,24 @@ class Order(Base):
 
     # Связь с позициями заказа
     items: Mapped[List["OrderItem"]] = relationship(
-        back_populates="order",
-        cascade="all,delete-orphan",
-        lazy="selectin"
+        back_populates="order", cascade="all,delete-orphan", lazy="selectin"
     )
 
     __table_args__ = (
         CheckConstraint(
             "status in ('pending','paid','canceled','shipped','completed')",
-            name="ck_orders_status"
+            name="ck_orders_status",
         ),
     )
+
+    def __repr__(self) -> str:
+        return f"<Order(id='{self.id}', status='{self.status}', total_cents={self.total_cents})>"
 
 
 class OrderItem(Base):
     """
     Модель позиции заказа.
-    
+
     Attributes:
         id: Уникальный идентификатор позиции
         order_id: ID заказа
@@ -91,18 +96,15 @@ class OrderItem(Base):
         item_price_cents: Цена товара в центах (снимок)
         order: Связь с заказом
     """
-    
+
     __tablename__ = "order_items"
 
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
     order_id: Mapped[str] = mapped_column(
-        UUID(as_uuid=False),
-        ForeignKey("orders.id", ondelete="CASCADE"),
-        index=True
+        UUID(as_uuid=False), ForeignKey("orders.id", ondelete="CASCADE"), index=True
     )
     product_id: Mapped[str] = mapped_column(
-        String(64),
-        ForeignKey("products.id", ondelete="RESTRICT")
+        String(64), ForeignKey("products.id", ondelete="RESTRICT")
     )
 
     qty: Mapped[int] = mapped_column(Integer)

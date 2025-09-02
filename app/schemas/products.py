@@ -1,6 +1,8 @@
 # FastAPI/app/schemas/products.py
-from typing import Optional, List
+from typing import List, Optional
+
 from pydantic import BaseModel, ConfigDict
+
 
 class ImageOut(BaseModel):
     model_config = ConfigDict(from_attributes=True)
@@ -10,11 +12,13 @@ class ImageOut(BaseModel):
     is_primary: bool
     url: Optional[str] = None
 
+
 class AttributeOut(BaseModel):
     model_config = ConfigDict(from_attributes=True)
     id: int
     key: str
     value: Optional[str]
+
 
 class ProductOut(BaseModel):
     model_config = ConfigDict(from_attributes=True)

@@ -1,10 +1,13 @@
 # FastAPI/app/schemas/orders.py
-from typing import Optional, List
-from pydantic import BaseModel, Field, ConfigDict
+from typing import List, Optional
+
+from pydantic import BaseModel, ConfigDict, Field
+
 
 class OrderItemIn(BaseModel):
     product_id: str
     qty: int = Field(ge=1)
+
 
 class CustomerIn(BaseModel):
     name: str
@@ -14,12 +17,14 @@ class CustomerIn(BaseModel):
     city: Optional[str] = None
     postal_code: Optional[str] = None
 
+
 class OrderCreate(BaseModel):
     customer: CustomerIn
     items: List[OrderItemIn]
     comment: Optional[str] = None
     shipping_cents: int = 0
     currency: str = "EUR"
+
 
 class OrderItemOut(BaseModel):
     model_config = ConfigDict(from_attributes=True)
@@ -28,6 +33,7 @@ class OrderItemOut(BaseModel):
     qty: int
     item_name: str
     item_price_cents: int
+
 
 class OrderOut(BaseModel):
     model_config = ConfigDict(from_attributes=True)

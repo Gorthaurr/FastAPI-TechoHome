@@ -3,21 +3,23 @@
 """
 
 from typing import List
-from sqlalchemy.orm import Mapped, mapped_column, relationship
+
 from sqlalchemy import Integer, String
+from sqlalchemy.orm import Mapped, mapped_column, relationship
+
 from .base import Base
 
 
 class Category(Base):
     """
     Модель категории товаров.
-    
+
     Attributes:
         id: Уникальный идентификатор категории
         slug: URL-friendly название категории
         products: Связь с товарами в этой категории
     """
-    
+
     __tablename__ = "categories"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
@@ -25,7 +27,8 @@ class Category(Base):
 
     # Связь с товарами (каскадное удаление)
     products: Mapped[List["Product"]] = relationship(
-        back_populates="category",
-        cascade="all,delete",
-        lazy="selectin"
+        back_populates="category", cascade="all,delete", lazy="selectin"
     )
+
+    def __repr__(self) -> str:
+        return f"<Category(id={self.id}, slug='{self.slug}')>"

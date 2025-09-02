@@ -6,17 +6,17 @@
 
 from .base import Base
 from .category import Category
-from .product import Product
-from .product_image import ProductImage
-from .product_attribute import ProductAttribute
 from .order import Order, OrderItem
+from .product import Product
+from .product_attribute import ProductAttribute
+from .product_image import ProductImage
 
 __all__ = [
     "Base",
-    "Category", 
+    "Category",
     "Product",
     "ProductImage",
     "ProductAttribute",
     "Order",
-    "OrderItem"
+    "OrderItem",
 ]

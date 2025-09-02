@@ -6,15 +6,15 @@ API endpoints для работы с заказами.
 """
 
 import uuid
+from typing import Any, Dict, List, Optional
 from uuid import UUID
-from typing import Optional, Dict, Any, List
+
 from fastapi import APIRouter, Depends, HTTPException, Query
+from sqlalchemy import desc, func, select
 from sqlalchemy.orm import Session, selectinload
-from sqlalchemy import select, func, desc
 
 from app.db.database import get_db
-from app.db.models import Product, Order, OrderItem
-
+from app.db.models import Order, OrderItem, Product
 
 router = APIRouter()
 
@@ -22,15 +22,15 @@ router = APIRouter()
 def _normalize_uuid(s: str) -> str:
     """
     Нормализация и валидация UUID.
-    
+
     Убирает фигурные скобки у {uuid} и проверяет корректность формата.
-    
+
     Args:
         s: Строка с UUID
-        
+
     Returns:
         str: Нормализованный UUID в нижнем регистре
-        
+
     Raises:
         HTTPException: Если UUID некорректный
     """
@@ -50,27 +50,26 @@ def list_orders(
     page: int = Query(1, ge=1, description="Номер страницы"),
     page_size: int = Query(20, ge=1, le=100, description="Размер страницы"),
     status: Optional[str] = Query(
-        None,
-        description="Фильтр по статусу: pending/paid/canceled/shipped/completed"
+        None, description="Фильтр по статусу: pending/paid/canceled/shipped/completed"
     ),
 ):
     """
     Получить список заказов с пагинацией и фильтрацией.
-    
+
     Поддерживает:
     - Пагинацию результатов
     - Фильтрацию по статусу заказа
     - Подсчет количества позиций в заказе
-    
+
     Args:
         db: Сессия базы данных
         page: Номер страницы (начиная с 1)
         page_size: Размер страницы (1-100)
         status: Фильтр по статусу заказа
-        
+
     Returns:
         dict: Список заказов с метаданными пагинации
-        
+
     Raises:
         HTTPException: При некорректных параметрах запроса
     """
@@ -81,38 +80,39 @@ def list_orders(
     total = db.scalar(count_stmt) or 0
 
     # Запрос с подсчетом позиций
-    stmt = (
-        select(
-            Order,
-            func.count(OrderItem.id).label("items_count"),
-        )
-        .outerjoin(OrderItem, OrderItem.order_id == Order.id)
-    )
+    stmt = select(
+        Order,
+        func.count(OrderItem.id).label("items_count"),
+    ).outerjoin(OrderItem, OrderItem.order_id == Order.id)
     if status:
         stmt = stmt.where(Order.status == status)
     stmt = (
         stmt.group_by(Order.id)
-            .order_by(desc(Order.created_at))
-            .offset((page - 1) * page_size)
-            .limit(page_size)
+        .order_by(desc(Order.created_at))
+        .offset((page - 1) * page_size)
+        .limit(page_size)
     )
 
     rows = db.execute(stmt).all()
     items: List[Dict[str, Any]] = []
-    
+
     for order, items_count in rows:
-        items.append({
-            "id": order.id,
-            "status": order.status,
-            "currency": order.currency,
-            "subtotal_cents": order.subtotal_cents,
-            "shipping_cents": order.shipping_cents,
-            "total_cents": order.total_cents,
-            "customer_name": order.customer_name,
-            "customer_email": order.customer_email,
-            "created_at": str(order.created_at) if order.created_at is not None else None,
-            "items_count": int(items_count or 0),
-        })
+        items.append(
+            {
+                "id": order.id,
+                "status": order.status,
+                "currency": order.currency,
+                "subtotal_cents": order.subtotal_cents,
+                "shipping_cents": order.shipping_cents,
+                "total_cents": order.total_cents,
+                "customer_name": order.customer_name,
+                "customer_email": order.customer_email,
+                "created_at": (
+                    str(order.created_at) if order.created_at is not None else None
+                ),
+                "items_count": int(items_count or 0),
+            }
+        )
 
     return {
         "items": items,
@@ -124,18 +124,18 @@ def list_orders(
 def create_order(payload: dict, db: Session = Depends(get_db)):
     """
     Создать новый заказ.
-    
+
     Создает заказ с указанными товарами и информацией о клиенте.
     Автоматически рассчитывает суммы и создает позиции заказа.
-    
+
     Ожидает JSON:
     {
       "customer": {
-        "name": "...", 
-        "email": "...", 
-        "phone": "...", 
-        "address": "...", 
-        "city": "...", 
+        "name": "...",
+        "email": "...",
+        "phone": "...",
+        "address": "...",
+        "city": "...",
         "postal_code": "..."
       },
       "items": [{"product_id": "ABC123", "qty": 2}, ...],
@@ -143,20 +143,20 @@ def create_order(payload: dict, db: Session = Depends(get_db)):
       "shipping_cents": 500,
       "currency": "EUR"
     }
-    
+
     Args:
         payload: Данные заказа
         db: Сессия базы данных
-        
+
     Returns:
         dict: Созданный заказ с позициями
-        
+
     Raises:
         HTTPException: При некорректных данных или отсутствующих товарах
     """
     if not isinstance(payload, dict):
         raise HTTPException(400, detail="Invalid request body")
-        
+
     customer = payload.get("customer") or {}
     items = payload.get("items") or []
     if not items:
@@ -167,7 +167,9 @@ def create_order(payload: dict, db: Session = Depends(get_db)):
     comment = payload.get("comment")
 
     # Проверка товаров и создание снимка цен/названий
-    product_ids = [str(item.get("product_id")) for item in items if item.get("product_id")]
+    product_ids = [
+        str(item.get("product_id")) for item in items if item.get("product_id")
+    ]
     rows = db.scalars(select(Product).where(Product.id.in_(product_ids))).all()
     product_map = {p.id: p for p in rows}
     missing = [pid for pid in product_ids if pid not in product_map]
@@ -198,19 +200,23 @@ def create_order(payload: dict, db: Session = Depends(get_db)):
         product_id = str(item.get("product_id"))
         qty = int(item.get("qty") or 0)
         if qty <= 0:
-            raise HTTPException(400, detail=f"Quantity must be > 0 for product {product_id}")
-            
+            raise HTTPException(
+                400, detail=f"Quantity must be > 0 for product {product_id}"
+            )
+
         product = product_map[product_id]
         price = int(product.price_cents or 0)
         subtotal += price * qty
-        
-        db.add(OrderItem(
-            order_id=order.id,
-            product_id=product.id,
-            qty=qty,
-            item_name=product.name,
-            item_price_cents=price,
-        ))
+
+        db.add(
+            OrderItem(
+                order_id=order.id,
+                product_id=product.id,
+                qty=qty,
+                item_name=product.name,
+                item_price_cents=price,
+            )
+        )
 
     # Обновление сумм заказа
     order.subtotal_cents = subtotal
@@ -221,9 +227,7 @@ def create_order(payload: dict, db: Session = Depends(get_db)):
 
     # Перечитываем заказ с предзагрузкой позиций
     order = db.scalar(
-        select(Order)
-        .options(selectinload(Order.items))
-        .where(Order.id == order.id)
+        select(Order).options(selectinload(Order.items)).where(Order.id == order.id)
     )
 
     return {
@@ -257,17 +261,17 @@ def create_order(payload: dict, db: Session = Depends(get_db)):
 def get_order(order_id: str, db: Session = Depends(get_db)):
     """
     Получить заказ по ID.
-    
+
     Возвращает полную информацию о заказе включая все позиции
     и данные о клиенте.
-    
+
     Args:
         order_id: UUID заказа
         db: Сессия базы данных
-        
+
     Returns:
         dict: Данные заказа с позициями
-        
+
     Raises:
         HTTPException: Если заказ не найден или UUID некорректный
     """
@@ -275,9 +279,7 @@ def get_order(order_id: str, db: Session = Depends(get_db)):
     order_id = _normalize_uuid(order_id)
 
     order = db.scalar(
-        select(Order)
-        .options(selectinload(Order.items))
-        .where(Order.id == order_id)
+        select(Order).options(selectinload(Order.items)).where(Order.id == order_id)
     )
     if not order:
         raise HTTPException(404, detail="Order not found")

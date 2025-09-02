@@ -4,10 +4,15 @@
 Содержит настройки подключения к PostgreSQL и фабрику сессий.
 """
 
-from sqlalchemy import create_engine
-from sqlalchemy.orm import sessionmaker
 from typing import Generator
+
+from sqlalchemy import create_engine
+from sqlalchemy.orm import declarative_base, sessionmaker
+
 from app.core.config import settings
+
+# Создание базового класса для моделей
+Base = declarative_base()
 
 
 # Создание движка SQLAlchemy
@@ -20,21 +25,16 @@ engine = create_engine(
 
 
 # Фабрика сессий базы данных
-SessionLocal = sessionmaker(
-    bind=engine,
-    autoflush=False,
-    autocommit=False,
-    future=True
-)
+SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False, future=True)
 
 
 def get_db() -> Generator:
     """
     Dependency для получения сессии базы данных.
-    
+
     Yields:
         Session: Сессия SQLAlchemy
-        
+
     Note:
         Автоматически закрывает сессию после использования
     """

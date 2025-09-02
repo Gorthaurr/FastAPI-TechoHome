@@ -5,18 +5,16 @@ API endpoints для работы с товарами.
 сортировки, пагинации и управления изображениями.
 """
 
-from typing import Optional, List, Literal, Dict, Any
+from typing import Any, Dict, List, Literal, Optional
+
 from fastapi import APIRouter, Depends, HTTPException, Query
-from sqlalchemy import select, and_, func, asc, desc
+from sqlalchemy import and_, asc, desc, func, select
 from sqlalchemy.orm import Session, selectinload
 
 from app.db.database import get_db
 from app.db.models import Product
-from app.core.config import settings
 from app.schemas.pagination import PageMeta
-from app.services.image_service import image_service
 from app.services.storage_service import storage_service
-
 
 router = APIRouter()
 
@@ -31,21 +29,25 @@ def list_products(
     page_size: int = Query(20, ge=1, le=100, description="Размер страницы"),
     category_id: Optional[int] = Query(None, description="Фильтр по категории"),
     q: Optional[str] = Query(None, description="Поиск по названию (ILIKE)"),
-    price_min: Optional[int] = Query(None, ge=0, description="Минимальная цена в центах"),
-    price_max: Optional[int] = Query(None, ge=0, description="Максимальная цена в центах"),
+    price_min: Optional[int] = Query(
+        None, ge=0, description="Минимальная цена в центах"
+    ),
+    price_max: Optional[int] = Query(
+        None, ge=0, description="Максимальная цена в центах"
+    ),
     sort: Optional[SortField] = Query("name", description="Поле для сортировки"),
     include_images: bool = Query(False, description="Включить изображения"),
     include_attributes: bool = Query(False, description="Включить атрибуты"),
 ):
     """
     Получить список товаров с фильтрацией, сортировкой и пагинацией.
-    
+
     Поддерживает:
     - Фильтрацию по категории, цене и поисковому запросу
     - Сортировку по названию и цене
     - Пагинацию результатов
     - Включение связанных данных (изображения, атрибуты)
-    
+
     Args:
         db: Сессия базы данных
         page: Номер страницы (начиная с 1)
@@ -57,10 +59,10 @@ def list_products(
         sort: Поле для сортировки (name, -name, price, -price)
         include_images: Включить изображения товаров
         include_attributes: Включить атрибуты товаров
-        
+
     Returns:
         dict: Список товаров с метаданными пагинации
-        
+
     Raises:
         HTTPException: При некорректных параметрах запроса
     """
@@ -98,7 +100,11 @@ def list_products(
         order = asc(Product.name) if sort == "name" else desc(Product.name)
     else:
         price_col = Product.price_cents
-        order = asc(price_col).nulls_last() if sort == "price" else desc(price_col).nulls_last()
+        order = (
+            asc(price_col).nulls_last()
+            if sort == "price"
+            else desc(price_col).nulls_last()
+        )
     stmt = stmt.order_by(order)
 
     # Пагинация
@@ -107,7 +113,7 @@ def list_products(
 
     # Формирование ответа
     items: List[Dict[str, Any]] = []
-    
+
     for product in rows:
         item = {
             "id": product.id,
@@ -117,12 +123,11 @@ def list_products(
             "price_cents": product.price_cents,
             "description": product.description,
         }
-        
+
         # Добавление изображений
         if include_images:
             images = sorted(
-                product.images,
-                key=lambda x: (not x.is_primary, x.sort_order, x.id)
+                product.images, key=lambda x: (not x.is_primary, x.sort_order, x.id)
             )
             item["images"] = []
             for img in images:
@@ -144,19 +149,21 @@ def list_products(
                     "alt_text": img.alt_text,
                 }
                 item["images"].append(image_data)
-            
+
         # Добавление атрибутов
         if include_attributes:
             item["attributes"] = [
                 {"id": attr.id, "key": attr.attr_key, "value": attr.value}
                 for attr in product.attributes
             ]
-            
+
         items.append(item)
 
     # Формирование метаданных пагинации
-    meta_data = PageMeta.create(page=page, page_size=page_size, total=total).model_dump()
-    
+    meta_data = PageMeta.create(
+        page=page, page_size=page_size, total=total
+    ).model_dump()
+
     return {
         "items": items,
         "meta": meta_data,
@@ -172,19 +179,19 @@ def get_product(
 ):
     """
     Получить товар по ID.
-    
+
     Возвращает полную информацию о товаре с возможностью
     включения связанных данных (изображения, атрибуты).
-    
+
     Args:
         product_id: ID товара
         db: Сессия базы данных
         include_images: Включить изображения товара
         include_attributes: Включить атрибуты товара
-        
+
     Returns:
         dict: Данные товара с включенными связями
-        
+
     Raises:
         HTTPException: Если товар не найден
     """
@@ -193,7 +200,7 @@ def get_product(
         stmt = stmt.options(selectinload(Product.images))
     if include_attributes:
         stmt = stmt.options(selectinload(Product.attributes))
-        
+
     product = db.scalar(stmt)
     if not product:
         raise HTTPException(404, detail="Product not found")
@@ -207,12 +214,11 @@ def get_product(
         "price_cents": product.price_cents,
         "description": product.description,
     }
-    
+
     # Добавление изображений
     if include_images:
         images = sorted(
-            product.images,
-            key=lambda x: (not x.is_primary, x.sort_order, x.id)
+            product.images, key=lambda x: (not x.is_primary, x.sort_order, x.id)
         )
         item["images"] = []
         for img in images:
@@ -234,7 +240,7 @@ def get_product(
                 "alt_text": img.alt_text,
             }
             item["images"].append(image_data)
-        
+
     # Добавление атрибутов
     if include_attributes:
         item["attributes"] = [
