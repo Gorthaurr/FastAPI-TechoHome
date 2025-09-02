@@ -14,6 +14,8 @@ from sqlalchemy.orm import Session, selectinload
 from app.db.database import get_db
 from app.db.models import Product, ProductImage
 from app.schemas.product import ImageCreate, ImageOut, ImageUpdate
+from app.core.auth import require_admin
+from app.db.models.user import User
 from app.services.image_processor import process_image_async
 from app.services.image_service import image_service
 from app.services.storage_service import storage_service
@@ -67,10 +69,10 @@ async def upload_product_image(
         # Генерируем путь для сохранения
         storage_path = image_service.generate_path(product_id, file.filename)
 
-        # Сохраняем файл в хранилище
-        file.file.seek(0)  # Сброс позиции в начало файла
-        if not storage_service.save_file(storage_path, file.file, file.content_type):
-            raise HTTPException(500, detail="Failed to save file to storage")
+        # Сохраняем файл в хранилище используя временный файл
+        with open(temp_file_path, 'rb') as temp_file_handle:
+            if not storage_service.save_file(storage_path, temp_file_handle, file.content_type):
+                raise HTTPException(500, detail="Failed to save file to storage")
 
         # Создаем запись в БД
         image = ProductImage(
@@ -89,29 +91,17 @@ async def upload_product_image(
 
         # Если это главное изображение, снимаем флаг с других
         if is_primary:
-            db.execute(
+            other_images = db.scalars(
                 select(ProductImage).where(
                     and_(
                         ProductImage.product_id == product_id,
                         ProductImage.id != image.id,
-                        ProductImage.is_primary.is_(True),
+                        ProductImage.is_primary == True,
                     )
                 )
-            ).scalars().all()
+            ).all()
 
-            for other_image in (
-                db.execute(
-                    select(ProductImage).where(
-                        and_(
-                            ProductImage.product_id == product_id,
-                            ProductImage.id != image.id,
-                            ProductImage.is_primary.is_(True),
-                        )
-                    )
-                )
-                .scalars()
-                .all()
-            ):
+            for other_image in other_images:
                 other_image.is_primary = False
 
         db.commit()
@@ -189,7 +179,12 @@ def get_image(
 
 
 @router.put("/{image_id}", response_model=ImageOut)
-def update_image(image_id: int, image_data: ImageUpdate, db: Session = Depends(get_db)):
+def update_image(
+    image_id: int, 
+    image_data: ImageUpdate, 
+    current_user: User = Depends(require_admin),
+    db: Session = Depends(get_db)
+):
     """
     Обновить метаданные изображения.
 
@@ -268,7 +263,11 @@ def update_image(image_id: int, image_data: ImageUpdate, db: Session = Depends(g
 
 
 @router.delete("/{image_id}")
-def delete_image(image_id: int, db: Session = Depends(get_db)):
+def delete_image(
+    image_id: int, 
+    current_user: User = Depends(require_admin),
+    db: Session = Depends(get_db)
+):
     """
     Удалить изображение.
 
@@ -384,6 +383,7 @@ async def get_processing_queue():
     status = await image_processor.get_queue_status()
 
     # Получаем статистику по статусам изображений
+    from app.db.database import SessionLocal
     db = SessionLocal()
     try:
         status_counts = db.execute(

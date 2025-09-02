@@ -55,7 +55,7 @@ class ProductImage(Base):
         Index("ix_product_images_uploaded_at", "uploaded_at"),
     )
 
-    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     product_id: Mapped[str] = mapped_column(
         String(64), ForeignKey("products.id", ondelete="CASCADE")
     )
