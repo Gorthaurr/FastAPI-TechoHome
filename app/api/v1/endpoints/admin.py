@@ -802,7 +802,7 @@ async def admin_list_products(
             "price_raw": product.price_raw,
             "price_cents": product.price_cents,
             "description": product.description,
-            "product_url": product.product_url,
+
             "images_count": images_count,
             "has_images": images_count > 0,
         }
@@ -841,7 +841,7 @@ async def admin_create_product(
         price_raw=product_data.get("price_raw"),
         price_cents=product_data.get("price_cents"),
         description=product_data.get("description"),
-        product_url=product_data.get("product_url"),
+
     )
     
     db.add(new_product)
@@ -855,7 +855,7 @@ async def admin_create_product(
         "price_raw": new_product.price_raw,
         "price_cents": new_product.price_cents,
         "description": new_product.description,
-        "product_url": new_product.product_url,
+
     }
 
 
@@ -892,14 +892,22 @@ async def admin_get_product(
     # Формируем ответ
     images = []
     for img in product.images:
-        images.append({
-            "id": img.id,
-            "path": img.path,
-            "filename": img.filename,
-            "is_primary": img.is_primary,
-            "sort_order": img.sort_order,
-            "status": img.status,
-        })
+            # Используем storage_service для генерации URL (как в основном API)
+            from app.services.storage_service import storage_service
+            image_url = storage_service.get_file_url(img.path)
+
+            # Логируем для отладки
+            print(f"Image ID: {img.id}, Path: {img.path}, URL: {image_url}")
+
+            images.append({
+                "id": img.id,
+                "path": img.path,
+                "filename": img.filename,
+                "url": image_url,  # Добавляем полный URL
+                "is_primary": img.is_primary,
+                "sort_order": img.sort_order,
+                "status": img.status,
+            })
     
     attributes = []
     for attr in product.attributes:
@@ -917,7 +925,7 @@ async def admin_get_product(
         "price_raw": product.price_raw,
         "price_cents": product.price_cents,
         "description": product.description,
-        "product_url": product.product_url,
+
         "images": images,
         "attributes": attributes,
     }
@@ -957,7 +965,6 @@ async def admin_update_product(
         "price_raw": product.price_raw,
         "price_cents": product.price_cents,
         "description": product.description,
-        "product_url": product.product_url,
     }
 
 
@@ -1086,6 +1093,8 @@ async def admin_upload_image(
     from app.services.image_service import image_service
     from app.services.storage_service import storage_service
     
+
+    
     # Проверяем существование товара
     from sqlalchemy import select
     product = db.scalar(select(Product).where(Product.id == product_id))
@@ -1101,23 +1110,24 @@ async def admin_upload_image(
         # Читаем содержимое файла
         content = await file.read()
         
-        # Простое сохранение в uploads
-        from pathlib import Path
-        from app.core.config import settings
+        # Используем storage_service для сохранения файла
+        from io import BytesIO
         
-        # Создаем структуру папок
-        upload_dir = Path(settings.STORAGE_PATH) / "products" / product_id[:8] / product_id
-        upload_dir.mkdir(parents=True, exist_ok=True)
+        # Создаем BytesIO объект для передачи в storage_service
+        file_data = BytesIO(content)
+        file_data.seek(0)
         
-        # Сохраняем файл
-        file_path = upload_dir / file.filename
-        with open(file_path, 'wb') as f:
-            f.write(content)
-
-        # Относительный путь для БД
+        # Генерируем путь для файла
         relative_path = f"products/{product_id[:8]}/{product_id}/{file.filename}"
+        print(f"Saving image to path: {relative_path}")
+
+        # Сохраняем файл через storage_service
+        success = storage_service.save_file(relative_path, file_data, file.content_type)
+        print(f"Save result: {success}")
+        if not success:
+            raise HTTPException(500, detail="Failed to save file to storage")
         
-        # Создаем запись в БД (только обязательные поля)
+        # Создаем запись в БД
         image = ProductImage()
         image.product_id = product_id
         image.path = relative_path
@@ -1127,6 +1137,7 @@ async def admin_upload_image(
         image.status = "ready"
         image.file_size = file.size
         image.alt_text = alt_text or f"Изображение для {product.name}"
+        print(f"Creating DB record: product_id={product_id}, path={relative_path}, filename={file.filename}")
 
         # Если это главное изображение, сначала снимаем флаг с других
         if is_primary:
@@ -1139,10 +1150,12 @@ async def admin_upload_image(
 
             for other_image in other_images:
                 other_image.is_primary = False
+                print(f"Unset primary for image ID: {other_image.id}")
 
         db.add(image)
         db.commit()
         db.refresh(image)  # Получаем ID после commit
+        print(f"DB record created with ID: {image.id}")
 
         return {
             "id": image.id,
@@ -1154,13 +1167,155 @@ async def admin_upload_image(
         }
 
     except Exception as e:
-        # Очистка при ошибке - удаляем файл если он был создан
+        # Очистка при ошибке - удаляем файл из хранилища если он был создан
         try:
-            if 'file_path' in locals() and file_path.exists():
-                file_path.unlink()
+            if 'relative_path' in locals():
+                storage_service.delete_file(relative_path)
         except:
             pass
         raise HTTPException(500, detail=f"Upload failed: {str(e)}")
+
+
+@router.delete("/products/{product_id}/images/{image_id}")
+async def admin_delete_image(
+    product_id: str,
+    image_id: int,
+    current_user: User = Depends(require_admin),
+    db: Session = Depends(get_db),
+):
+    """
+    Удалить изображение товара.
+    """
+    from app.db.models import ProductImage
+    from sqlalchemy import select
+
+    # Проверяем существование товара
+    product = db.scalar(select(Product).where(Product.id == product_id))
+    if not product:
+        raise HTTPException(404, detail="Product not found")
+
+    # Проверяем существование изображения
+    image = db.scalar(
+        select(ProductImage).where(
+            ProductImage.id == image_id,
+            ProductImage.product_id == product_id
+        )
+    )
+    if not image:
+        raise HTTPException(404, detail="Image not found")
+
+    try:
+        # Удаляем файл из хранилища
+        from app.services.storage_service import storage_service
+        print(f"Deleting image from storage: {image.path}")
+        storage_service.delete_file(image.path)
+
+        # Удаляем запись из БД
+        print(f"Deleting image from DB: ID {image.id}")
+        db.delete(image)
+        db.commit()
+
+        return {"message": "Image deleted successfully"}
+
+    except Exception as e:
+        print(f"Error deleting image: {e}")
+        raise HTTPException(500, detail=f"Delete failed: {str(e)}")
+
+
+@router.put("/products/{product_id}/images/{image_id}/primary")
+async def admin_set_primary_image(
+    product_id: str,
+    image_id: int,
+    current_user: User = Depends(require_admin),
+    db: Session = Depends(get_db),
+):
+    """
+    Установить изображение как главное.
+    """
+    from app.db.models import ProductImage
+    from sqlalchemy import select
+
+    # Проверяем существование товара
+    product = db.scalar(select(Product).where(Product.id == product_id))
+    if not product:
+        raise HTTPException(404, detail="Product not found")
+
+    # Проверяем существование изображения
+    image = db.scalar(
+        select(ProductImage).where(
+            ProductImage.id == image_id,
+            ProductImage.product_id == product_id
+        )
+    )
+    if not image:
+        raise HTTPException(404, detail="Image not found")
+
+    try:
+        # Сначала снимаем флаг главного изображения с всех других изображений товара
+        db.execute(
+            select(ProductImage).where(
+                ProductImage.product_id == product_id,
+                ProductImage.is_primary == True
+            )
+        )
+        other_images = db.scalars(
+            select(ProductImage).where(
+                ProductImage.product_id == product_id,
+                ProductImage.is_primary == True
+            )
+        ).all()
+
+        for other_image in other_images:
+            other_image.is_primary = False
+
+        # Устанавливаем флаг главного изображения для выбранного изображения
+        image.is_primary = True
+        db.commit()
+
+        return {"message": "Primary image set successfully"}
+
+    except Exception as e:
+        print(f"Error setting primary image: {e}")
+        raise HTTPException(500, detail=f"Set primary failed: {str(e)}")
+
+
+@router.put("/products/{product_id}/images/reorder")
+async def admin_reorder_images(
+    product_id: str,
+    image_ids: List[int],
+    current_user: User = Depends(require_admin),
+    db: Session = Depends(get_db),
+):
+    """
+    Изменить порядок изображений товара.
+    """
+    from app.db.models import ProductImage
+    from sqlalchemy import select
+
+    # Проверяем существование товара
+    product = db.scalar(select(Product).where(Product.id == product_id))
+    if not product:
+        raise HTTPException(404, detail="Product not found")
+
+    try:
+        # Обновляем порядок сортировки для каждого изображения
+        for index, image_id in enumerate(image_ids):
+            image = db.scalar(
+                select(ProductImage).where(
+                    ProductImage.id == image_id,
+                    ProductImage.product_id == product_id
+                )
+            )
+            if image:
+                image.sort_order = index
+
+        db.commit()
+
+        return {"message": "Images reordered successfully"}
+
+    except Exception as e:
+        print(f"Error reordering images: {e}")
+        raise HTTPException(500, detail=f"Reorder failed: {str(e)}")
 
 
 # ==================== УПРАВЛЕНИЕ ЗАКАЗАМИ ====================

@@ -87,7 +87,7 @@ def products_raw(
             db.execute(
                 text(
                     """
-            SELECT id, category_id, name, product_url, price_raw, price_cents, description
+            SELECT id, category_id, name, price_raw, price_cents, description
             FROM public.products
             ORDER BY name ASC NULLS LAST
             LIMIT :lim

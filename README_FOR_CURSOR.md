@@ -28,7 +28,7 @@ interface Product {
   description: string;           // Описание
   price_raw: string;             // Цена в строковом формате (например: "181 272 ₽")
   price_cents: number;           // Цена в копейках (18127200)
-  product_url: string;           // URL продукта на сайте
+
   images?: ProductImage[];       // Массив изображений (опционально)
   attributes?: ProductAttribute[]; // Массив атрибутов (опционально)
 }

@@ -68,6 +68,7 @@ async def upload_product_image(
     try:
         # Генерируем путь для сохранения
         storage_path = image_service.generate_path(product_id, file.filename)
+        print(f"🖼️  IMAGES API: Saving image via images.py endpoint: {storage_path}")
 
         # Сохраняем файл в хранилище используя временный файл
         with open(temp_file_path, 'rb') as temp_file_handle:

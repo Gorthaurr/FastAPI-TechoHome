@@ -68,7 +68,7 @@ class ProductOut(BaseModel):
     id: str
     category_id: int
     name: str
-    product_url: Optional[str]
+
     price_raw: Optional[str]
     price_cents: Optional[int]
     description: Optional[str]

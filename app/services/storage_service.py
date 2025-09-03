@@ -115,12 +115,14 @@ class LocalStorageProvider(StorageProvider):
             bool: True если файл успешно сохранен
         """
         try:
+            print(f"❌ LOCAL STORAGE: Saving file to {file_path}")
             full_path = self.base_path / file_path
             full_path.parent.mkdir(parents=True, exist_ok=True)
 
             with open(full_path, "wb") as f:
                 shutil.copyfileobj(file_data, f)
 
+            print(f"❌ LOCAL STORAGE: File saved to {full_path}")
             return True
         except Exception as e:
             print(f"Error saving file to local storage: {e}")
@@ -218,13 +220,18 @@ class S3StorageProvider(StorageProvider):
             bool: True если файл успешно сохранен
         """
         try:
+            print(f"✅ S3 STORAGE: Saving file to {file_path}")
+            print(f"✅ S3 STORAGE: Bucket: {self.bucket_name}, Endpoint: {self.s3_client.meta.endpoint_url}")
+
             extra_args = {}
             if content_type:
                 extra_args["ContentType"] = content_type
 
+            print(f"✅ S3 STORAGE: Uploading file to S3...")
             self.s3_client.upload_fileobj(
                 file_data, self.bucket_name, file_path, ExtraArgs=extra_args
             )
+            print(f"✅ S3 STORAGE: File uploaded successfully to S3")
             return True
         except (ClientError, NoCredentialsError) as e:
             print(f"Error saving file to S3: {e}")
@@ -241,12 +248,14 @@ class S3StorageProvider(StorageProvider):
             Optional[str]: URL файла для доступа
         """
         try:
+            print(f"Generating presigned URL for path: {file_path}")
             # Генерируем presigned URL для доступа к файлу
             url = self.s3_client.generate_presigned_url(
                 "get_object",
                 Params={"Bucket": self.bucket_name, "Key": file_path},
                 ExpiresIn=3600,  # URL действителен 1 час
             )
+            print(f"Generated URL: {url}")
             return url
         except (ClientError, NoCredentialsError) as e:
             print(f"Error generating S3 URL: {e}")
@@ -263,7 +272,9 @@ class S3StorageProvider(StorageProvider):
             bool: True если файл успешно удален
         """
         try:
+            print(f"Deleting file from S3: {file_path}")
             self.s3_client.delete_object(Bucket=self.bucket_name, Key=file_path)
+            print(f"File deleted successfully from S3")
             return True
         except (ClientError, NoCredentialsError) as e:
             print(f"Error deleting file from S3: {e}")
@@ -287,11 +298,25 @@ class S3StorageProvider(StorageProvider):
 
 
 # Создание экземпляра хранилища в зависимости от настроек
+print("=" * 50)
+print("STORAGE SERVICE INITIALIZATION")
+print("=" * 50)
+print(f"STORAGE_TYPE: {settings.STORAGE_TYPE}")
+print(f"S3_BUCKET_NAME: {settings.S3_BUCKET_NAME}")
+print(f"S3_ENDPOINT_URL: {settings.S3_ENDPOINT_URL}")
+
 if settings.STORAGE_TYPE == "s3":
+    print("Creating S3StorageProvider...")
     storage_service = S3StorageProvider(
         bucket_name=settings.S3_BUCKET_NAME,
         region=settings.AWS_REGION,
         endpoint_url=settings.S3_ENDPOINT_URL,
     )
+    print("✅ S3StorageProvider created successfully")
 else:
+    print("Creating LocalStorageProvider...")
     storage_service = LocalStorageProvider()
+    print("✅ LocalStorageProvider created successfully")
+
+print(f"Final storage service: {type(storage_service)}")
+print("=" * 50)
