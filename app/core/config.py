@@ -28,7 +28,7 @@ class Settings(BaseSettings):
     # Настройки хранилища изображений
     STORAGE_TYPE: str = Field(default="local", description="Тип хранилища: local/s3")
     STORAGE_PATH: str = Field(
-        default="uploads", description="Путь для локального хранения файлов"
+        default="./demo_images", description="Путь для локального хранения файлов (демо)"
     )
     MAX_IMAGE_SIZE: int = Field(
         default=10 * 1024 * 1024,  # 10MB

@@ -12,6 +12,9 @@ python-dotenv
 pydantic[email]
 passlib[bcrypt]
 python-jose[cryptography]
+requests
+httpx
+beautifulsoup4
 
 # Development dependencies
 black
