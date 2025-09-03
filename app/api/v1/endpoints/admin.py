@@ -1222,61 +1222,7 @@ async def admin_delete_image(
         raise HTTPException(500, detail=f"Delete failed: {str(e)}")
 
 
-@router.put("/products/{product_id}/images/{image_id}/primary")
-async def admin_set_primary_image(
-    product_id: str,
-    image_id: int,
-    current_user: User = Depends(require_admin),
-    db: Session = Depends(get_db),
-):
-    """
-    Установить изображение как главное.
-    """
-    from app.db.models import ProductImage
-    from sqlalchemy import select
 
-    # Проверяем существование товара
-    product = db.scalar(select(Product).where(Product.id == product_id))
-    if not product:
-        raise HTTPException(404, detail="Product not found")
-
-    # Проверяем существование изображения
-    image = db.scalar(
-        select(ProductImage).where(
-            ProductImage.id == image_id,
-            ProductImage.product_id == product_id
-        )
-    )
-    if not image:
-        raise HTTPException(404, detail="Image not found")
-
-    try:
-        # Сначала снимаем флаг главного изображения с всех других изображений товара
-        db.execute(
-            select(ProductImage).where(
-                ProductImage.product_id == product_id,
-                ProductImage.is_primary == True
-            )
-        )
-        other_images = db.scalars(
-            select(ProductImage).where(
-                ProductImage.product_id == product_id,
-                ProductImage.is_primary == True
-            )
-        ).all()
-
-        for other_image in other_images:
-            other_image.is_primary = False
-
-        # Устанавливаем флаг главного изображения для выбранного изображения
-        image.is_primary = True
-        db.commit()
-
-        return {"message": "Primary image set successfully"}
-
-    except Exception as e:
-        print(f"Error setting primary image: {e}")
-        raise HTTPException(500, detail=f"Set primary failed: {str(e)}")
 
 
 @router.put("/products/{product_id}/images/reorder")
