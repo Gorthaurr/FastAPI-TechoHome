@@ -18,6 +18,7 @@ import urllib3
 import time
 import random
 import re
+from datetime import datetime
 
 # Отключаем предупреждения о SSL
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
@@ -28,6 +29,9 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 # Принудительно устанавливаем STORAGE_TYPE в s3 для парсера
 os.environ['STORAGE_TYPE'] = 's3'
+
+# Принудительно подключаемся к Docker БД вместо локальной
+os.environ['DATABASE_URL'] = 'postgresql+psycopg2://postgres:password@localhost:5433/fastapi_shop'
 
 from app.db.database import SessionLocal
 from app.db.models.product import Product
@@ -465,40 +469,36 @@ class QualityImageParser:
                 if existing_primary:
                     is_primary = False  # Делаем не primary если уже есть
             
-            # Создаем запись
+            # Создаем запись с обязательными полями
             image_record = ProductImage(
                 product_id=product_id,
                 path=storage_path,
                 filename=os.path.basename(storage_path),
                 is_primary=is_primary,
                 status="ready",
-                alt_text=alt_text or f"Изображение товара"
+                alt_text=alt_text or f"Изображение товара",
+                sort_order=0,
+                uploaded_at=datetime.utcnow(),
+                processed_at=datetime.utcnow()
             )
             
             db.add(image_record)
+            db.flush()  # Проверяем, что запись может быть создана
             db.commit()
-            print(f"✅ Запись в БД создана: {storage_path} (primary: {is_primary})")
+            print(f"✅ Запись в БД создана: ID={image_record.id}, path={storage_path}, primary={is_primary}")
             return True
                 
         except Exception as e:
             db.rollback()
             print(f"❌ Ошибка создания записи в БД: {e}")
+            import traceback
+            traceback.print_exc()
             return False
 
     def process_product(self, product: Product, num_images: int = 3) -> int:
         """Обработка одного товара."""
         print(f"\n🎯 Обрабатываем товар: '{product.name}' (ID: {product.id})")
         print("-" * 60)
-        
-        # Проверяем, есть ли уже изображения для этого товара
-        with SessionLocal() as db:
-            existing_images = db.query(ProductImage).filter(
-                ProductImage.product_id == product.id
-            ).count()
-            
-            if existing_images > 0:
-                print(f"⏭️  У товара уже есть {existing_images} изображений, пропускаем")
-                return 0
         
         # Получаем URL изображений
         image_urls = self.get_product_images(product.name, num_images)
@@ -507,7 +507,7 @@ class QualityImageParser:
             print("❌ Не удалось найти изображения")
             return 0
         
-        print(f"📋 Найдено {len(image_urls)} изображений")
+        print(f"📋 Найдено {len(image_urls)} изображений для обработки")
         
         saved_count = 0
         
@@ -533,8 +533,10 @@ class QualityImageParser:
             # Создаем запись в БД
             with SessionLocal() as db:
                 is_primary = (saved_count == 0)  # Первое изображение делаем primary
-                if self.create_image_record(db, product.id, storage_path, is_primary):
+                alt_text = f"Изображение товара {product.name}"
+                if self.create_image_record(db, product.id, storage_path, is_primary, alt_text):
                     saved_count += 1
+                    print(f"📋 Добавлена запись в product_images для товара {product.id}")
         
         print(f"\n✅ Сохранено изображений: {saved_count}/{len(image_urls)}")
         return saved_count
@@ -585,12 +587,55 @@ class QualityImageParser:
         """Очистка записей изображений в БД."""
         try:
             print("🗑️  Очистка записей изображений в БД...")
-            with SessionLocal() as db:
-                deleted_count = db.query(ProductImage).delete()
-                db.commit()
-                print(f"✅ Удалено записей из БД: {deleted_count}")
+            
+            # Создаем новую сессию для очистки
+            db = SessionLocal()
+            
+            try:
+                # Получаем количество записей для отчета
+                count_before = db.query(ProductImage).count()
+                print(f"📊 Найдено записей для удаления: {count_before}")
+                
+                if count_before > 0:
+                    print("🗑️  Начинаем удаление записей...")
+                    
+                    # Удаляем записи батчами для избежания блокировок
+                    batch_size = 1000
+                    total_deleted = 0
+                    
+                    while True:
+                        # Получаем батч записей для удаления
+                        batch = db.query(ProductImage).limit(batch_size).all()
+                        
+                        if not batch:
+                            break
+                            
+                        # Удаляем батч
+                        for record in batch:
+                            db.delete(record)
+                        
+                        db.commit()
+                        total_deleted += len(batch)
+                        print(f"🗑️  Удалено записей: {total_deleted}/{count_before}")
+                    
+                    # Проверяем результат
+                    count_after = db.query(ProductImage).count()
+                    print(f"✅ Удалено записей из БД: {total_deleted}")
+                    print(f"📊 Осталось записей: {count_after}")
+                    
+                else:
+                    print("📭 Таблица product_images уже пуста")
+            
+            except Exception as e:
+                db.rollback()
+                raise e
+            finally:
+                db.close()
+                    
         except Exception as e:
             print(f"❌ Ошибка очистки БД: {e}")
+            import traceback
+            traceback.print_exc()
 
     def get_products_from_db(self) -> List[Product]:
         """Получение всех товаров из БД."""
@@ -625,10 +670,24 @@ def main():
     
     try:
         # Очистка старых данных
-        print("🗑️  Очистка старых данных...")
+        print("🗑️  НАЧАЛО ОЧИСТКИ СТАРЫХ ДАННЫХ")
+        print("=" * 50)
+        
+        # Проверяем текущее состояние БД
+        with SessionLocal() as db:
+            current_count = db.query(ProductImage).count()
+            print(f"📊 Текущее количество записей в product_images: {current_count}")
+        
         parser.clear_minio_products()
         parser.clear_database_images()
-        print("✅ Полная очистка завершена!")
+        
+        # Проверяем состояние после очистки
+        with SessionLocal() as db:
+            after_count = db.query(ProductImage).count()
+            print(f"📊 Количество записей после очистки: {after_count}")
+        
+        print("✅ ПОЛНАЯ ОЧИСТКА ЗАВЕРШЕНА!")
+        print("=" * 50)
         print()
         
         # Получаем товары из БД
@@ -647,23 +706,40 @@ def main():
         
         for product in products:
             try:
+                print(f"\n🔄 Обрабатываем товар {processed + 1}/{len(products)}")
                 saved = parser.process_product(product, num_images=3)
                 total_saved += saved
                 processed += 1
                 
+                # Проверяем количество записей в БД после каждого товара
+                with SessionLocal() as db:
+                    total_records = db.query(ProductImage).count()
+                    product_records = db.query(ProductImage).filter(
+                        ProductImage.product_id == product.id
+                    ).count()
+                    print(f"📊 Всего записей в БД: {total_records}, для товара {product.id}: {product_records}")
+                
                 # Небольшая пауза между товарами
-                time.sleep(random.uniform(3, 6))
+                time.sleep(random.uniform(2, 4))
                 
             except KeyboardInterrupt:
                 print("\n⏹️  Прервано пользователем")
                 break
             except Exception as e:
                 print(f"❌ Ошибка обработки товара {product.name}: {e}")
+                import traceback
+                traceback.print_exc()
                 continue
         
-        print(f"\n🎉 Парсинг завершен!")
+        print(f"\n🎉 ПАРСИНГ ЗАВЕРШЕН!")
+        print("=" * 50)
         print(f"📊 Обработано товаров: {processed}")
         print(f"📸 Всего сохранено изображений: {total_saved}")
+        
+        # Финальная проверка БД
+        with SessionLocal() as db:
+            final_count = db.query(ProductImage).count()
+            print(f"📊 ИТОГОВОЕ количество записей в product_images: {final_count}")
         
     finally:
         # Закрываем DrissionPage
