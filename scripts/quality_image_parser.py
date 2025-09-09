@@ -2,6 +2,7 @@
 # -*- coding: utf-8 -*-
 """
 Парсер изображений товаров (DrissionPage)
+
 Логика на КАЖДУЮ картинку:
 1) По названию из БД открываем выдачу Яндекс.Картинок
 2) Кликаем плитку -> открывается модалка
@@ -10,12 +11,18 @@
 5) Загружаем этот локальный файл в MinIO (механизм из «рабочей» версии), создаём запись в Postgres
 6) Удаляем локальный файл
 По 3 изображения на товар. Без ретраев.
+
+НОВОЕ: при запуске выполняется очистка:
+- MinIO (префикс products/)
+- Postgres (таблица product_images)
+- локальные артефакты (downloaded_images, html_dumps)
 """
 
 import sys
 import os
 import re
 import time
+import shutil
 import warnings
 from io import BytesIO
 from datetime import datetime
@@ -25,6 +32,11 @@ from urllib.parse import quote, urljoin, urlparse
 import requests
 import urllib3
 from PIL import Image
+
+# S3 / MinIO
+import boto3
+from botocore.client import Config
+from botocore.exceptions import ClientError
 
 # ---------- Отключение SSL-предупреждений ----------
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
@@ -77,18 +89,12 @@ def _guess_ext(url: str, content_type: str) -> str:
         return '.tiff'
     if content_type:
         ct = content_type.lower()
-        if 'jpeg' in ct:
-            return '.jpg'
-        if 'png' in ct:
-            return '.png'
-        if 'webp' in ct:
-            return '.webp'
-        if 'gif' in ct:
-            return '.gif'
-        if 'bmp' in ct:
-            return '.bmp'
-        if 'tiff' in ct:
-            return '.tiff'
+        if 'jpeg' in ct: return '.jpg'
+        if 'png'  in ct: return '.png'
+        if 'webp' in ct: return '.webp'
+        if 'gif'  in ct: return '.gif'
+        if 'bmp'  in ct: return '.bmp'
+        if 'tiff' in ct: return '.tiff'
     return '.jpg'
 
 
@@ -132,6 +138,83 @@ class QualityImageParser:
         self.min_side = min_side
         self.download_root = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'downloaded_images')
         _ensure_dir(self.download_root)
+
+    # -------------------- Очистка при запуске --------------------
+
+    def clear_minio_products(self, prefix: str = 'products/'):
+        """Удаляет все объекты из MinIO с указанным префиксом."""
+        print("🗑️  Очистка MinIO...")
+        try:
+            s3 = boto3.client(
+                "s3",
+                endpoint_url=settings.S3_ENDPOINT_URL,
+                aws_access_key_id=settings.AWS_ACCESS_KEY_ID,
+                aws_secret_access_key=settings.AWS_SECRET_ACCESS_KEY,
+                region_name=settings.AWS_REGION,
+                config=Config(s3={'addressing_style': 'path'}, signature_version='s3v4'),
+            )
+            paginator = s3.get_paginator('list_objects_v2')
+            total_deleted = 0
+            for page in paginator.paginate(Bucket=settings.S3_BUCKET_NAME, Prefix=prefix):
+                if 'Contents' not in page:
+                    continue
+                # удаляем пачками до 1000
+                objs = [{'Key': obj['Key']} for obj in page['Contents']]
+                while objs:
+                    batch = objs[:1000]
+                    del_request = {'Objects': batch, 'Quiet': True}
+                    s3.delete_objects(Bucket=settings.S3_BUCKET_NAME, Delete=del_request)
+                    total_deleted += len(batch)
+                    objs = objs[1000:]
+            if total_deleted:
+                print(f"✅ MinIO: удалено объектов: {total_deleted}")
+            else:
+                print("📭 MinIO: по префиксу ничего не найдено")
+        except Exception as e:
+            print(f"❌ Ошибка очистки MinIO: {e}")
+
+    def clear_database_images(self):
+        """Удаляет все записи из product_images батчами."""
+        print("🗑️  Очистка записей в БД (product_images)...")
+        try:
+            with SessionLocal() as db:
+                before = db.query(ProductImage).count()
+                print(f"📊 В БД записей до очистки: {before}")
+                if before == 0:
+                    print("📭 Очистка БД: уже пусто")
+                    return
+                batch_size = 1000
+                deleted_total = 0
+                while True:
+                    batch = db.query(ProductImage).limit(batch_size).all()
+                    if not batch:
+                        break
+                    for rec in batch:
+                        db.delete(rec)
+                    db.commit()
+                    deleted_total += len(batch)
+                    print(f"🗑️  Удалено батчом: {len(batch)} (итого: {deleted_total}/{before})")
+                after = db.query(ProductImage).count()
+                print(f"✅ Очистка БД завершена. Осталось записей: {after}")
+        except Exception as e:
+            print(f"❌ Ошибка очистки БД: {e}")
+
+    def clear_local_artifacts(self):
+        """Удаляет локальные каталоги downloaded_images и html_dumps и создаёт их заново."""
+        print("🗑️  Очистка локальных артефактов...")
+        base_dir = os.path.dirname(os.path.abspath(__file__))
+        dirs = [
+            os.path.join(base_dir, 'downloaded_images'),
+            os.path.join(base_dir, 'html_dumps'),
+        ]
+        for d in dirs:
+            try:
+                if os.path.exists(d):
+                    shutil.rmtree(d, ignore_errors=True)
+                os.makedirs(d, exist_ok=True)
+                print(f"✅ Локально очищено и пересоздано: {d}")
+            except Exception as e:
+                print(f"❌ Ошибка очистки каталога {d}: {e}")
 
     # -------------------- Браузер --------------------
 
@@ -261,28 +344,20 @@ class QualityImageParser:
         """Ищем элемент «Открыть» максимально жёстко по тексту."""
         try:
             e = self.page.ele('xpath://a[normalize-space()="Открыть"]', timeout=0.3)
-            if e:
-                return e
-        except Exception:
-            pass
+            if e: return e
+        except Exception: pass
         try:
             e = self.page.ele('xpath://button[normalize-space()="Открыть"]', timeout=0.3)
-            if e:
-                return e
-        except Exception:
-            pass
+            if e: return e
+        except Exception: pass
         try:
             e = self.page.ele('text:Открыть', timeout=0.3)
-            if e:
-                return e
-        except Exception:
-            pass
+            if e: return e
+        except Exception: pass
         try:
             els = self.page.eles('css:a[aria-label*="Открыть"],a[title*="Открыть"]') or []
-            if els:
-                return els[0]
-        except Exception:
-            pass
+            if els: return els[0]
+        except Exception: pass
         return None
 
     def _click_open_button_and_get_href(self) -> Optional[str]:
@@ -294,20 +369,14 @@ class QualityImageParser:
 
         href = btn.attr('href') or ''
         if href:
-            if href.startswith('//'):
-                href = 'https:' + href
-            elif href.startswith('/'):
-                href = urljoin('https://yandex.ru', href)
+            if href.startswith('//'): href = 'https:' + href
+            elif href.startswith('/'): href = urljoin('https://yandex.ru', href)
 
         try:
-            try:
-                btn.scroll.to_see()
-            except Exception:
-                pass
-            try:
-                btn.click()
-            except Exception:
-                btn.click(by_js=True)
+            try: btn.scroll.to_see()
+            except Exception: pass
+            try: btn.click()
+            except Exception: btn.click(by_js=True)
             print("✅ Клик по «Открыть» выполнен")
         except Exception as e:
             print(f"⚠️  Ошибка клика по «Открыть»: {e}")
@@ -325,33 +394,25 @@ class QualityImageParser:
         for sel in selectors:
             try:
                 tiles = self.page.eles(sel) or []
-                if tile_index >= len(tiles):
-                    continue
+                if tile_index >= len(tiles): continue
                 t = tiles[tile_index]
-                try:
-                    t.scroll.to_see()
-                except Exception:
-                    pass
-                try:
-                    t.click()
-                except Exception:
-                    t.click(by_js=True)
+                try: t.scroll.to_see()
+                except Exception: pass
+                try: t.click()
+                except Exception: t.click(by_js=True)
 
                 if self._wait_modal_opened(timeout=4.0):
                     print(f"✅ Модалка открыта по плитке #{tile_index+1} ({sel})")
                     return True
 
                 print(f"ℹ️  Модалка не распознана после клика по плитке #{tile_index+1} ({sel})")
-                try:
-                    self.page.key.press('Escape')
-                except Exception:
-                    pass
+                try: self.page.key.press('Escape')
+                except Exception: pass
                 time.sleep(0.2)
 
             except Exception as e:
                 print(f"⚠️  Ошибка при попытке клика по селектору {sel}: {e}")
                 continue
-
         return False
 
     # -------------------- Шаг 4: скачать ЛОКАЛЬНО --------------------
@@ -380,7 +441,6 @@ class QualityImageParser:
         content_type = resp.headers.get('content-type', '')
         ext = _guess_ext(url, content_type)
 
-        # Проверим изображение и минимальный размер
         data = BytesIO(resp.content)
         try:
             with Image.open(data) as im:
@@ -393,7 +453,6 @@ class QualityImageParser:
             print(f"⚠️  PIL ошибка: {e}")
             return None
 
-        # Путь сохранения
         folder = os.path.join(self.download_root, _safe_filename(product_name))
         _ensure_dir(folder)
         filename = f"img_{seq:03d}{ext}"
@@ -536,15 +595,15 @@ class QualityImageParser:
                         t = part.strip().split()
                         if not t:
                             continue
-                        url = t[0]
+                        u = t[0]
                         w = 0
                         if len(t) > 1 and t[1].endswith('w'):
                             try:
                                 w = int(t[1][:-1])
                             except Exception:
                                 w = 0
-                        if url.startswith('http') and w > best_w:
-                            best_w, best_url = w, url
+                        if u.startswith('http') and w > best_w:
+                            best_w, best_url = w, u
                     continue
                 src = img.attr('src')
                 if src and src.startswith('http') and best_w < 0:
@@ -691,6 +750,29 @@ def main():
     parser = QualityImageParser(min_side=300)
 
     try:
+        # ----- ОЧИСТКА ПРИ ЗАПУСКЕ -----
+        print("🧯 НАЧИНАЕМ ОЧИСТКУ ПРИ ЗАПУСКЕ")
+        # До очистки — просто статистика по БД
+        try:
+            with SessionLocal() as db:
+                before_count = db.query(ProductImage).count()
+                print(f"📊 В БД product_images до очистки: {before_count}")
+        except Exception as e:
+            print(f"⚠️  Не удалось получить статистику по БД: {e}")
+
+        parser.clear_minio_products(prefix='products/')
+        parser.clear_database_images()
+        parser.clear_local_artifacts()
+
+        # После очистки — проверка
+        try:
+            with SessionLocal() as db:
+                after_count = db.query(ProductImage).count()
+                print(f"📊 В БД product_images после очистки: {after_count}")
+        except Exception as e:
+            print(f"⚠️  Не удалось получить статистику по БД после очистки: {e}")
+
+        # ----- ПАРСИНГ -----
         products = parser.get_products_from_db()
         if not products:
             print("❌ В БД нет товаров")
