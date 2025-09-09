@@ -10,6 +10,7 @@ from .order import Order, OrderItem
 from .product import Product
 from .product_attribute import ProductAttribute
 from .product_image import ProductImage
+from .user import User
 
 __all__ = [
     "Base",
@@ -19,4 +20,5 @@ __all__ = [
     "ProductAttribute",
     "Order",
     "OrderItem",
+    "User",
 ]

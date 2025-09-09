@@ -38,7 +38,7 @@ class SystemRunner:
         # Настройки (обновлены в соответствии с docker-compose.yml)
         self.fastapi_port = 8000
         self.postgres_port = 5433
-        self.minio_api_port = 9002  # Изменено с 9000 на 9002
+        self.minio_api_port = 9000  # MinIO API порт
         self.minio_console_port = 9001
         self.redis_port = 6379
         self.pgadmin_port = 5050  # Добавлен pgAdmin
@@ -270,16 +270,24 @@ DEBUG=true
         bucket_name = "product-images"
 
         try:
-            # Ждем готовности MinIO
-            import socket
-
+            # Ждем готовности MinIO через mc команды
             for attempt in range(30):  # 1 минута
                 try:
-                    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                    sock.settimeout(2)
-                    result = sock.connect_ex(("localhost", self.minio_api_port))
-                    sock.close()
-                    if result == 0:
+                    # Проверяем, что MinIO отвечает через mc
+                    result = subprocess.run(
+                        [
+                            "docker",
+                            "exec",
+                            "scripts-minio-1",
+                            "mc",
+                            "alias",
+                            "list"
+                        ],
+                        capture_output=True,
+                        text=True,
+                        timeout=5,
+                    )
+                    if result.returncode == 0:
                         break
                 except:
                     pass
@@ -318,6 +326,28 @@ DEBUG=true
 
                 # Создаем bucket через MinIO client
                 try:
+                    # Сначала настраиваем mc alias
+                    alias_result = subprocess.run(
+                        [
+                            "docker",
+                            "exec",
+                            container_name,
+                            "mc",
+                            "alias",
+                            "set",
+                            "local",
+                            "http://localhost:9000",
+                            "minioadmin",
+                            "minioadmin"
+                        ],
+                        capture_output=True,
+                        text=True,
+                        timeout=10,
+                    )
+                    
+                    if alias_result.returncode == 0:
+                        self.print_status("✅ MinIO mc alias настроен", Colors.GREEN)
+                    
                     # Пытаемся создать bucket
                     result = subprocess.run(
                         [

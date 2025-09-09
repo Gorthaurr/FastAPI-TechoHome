@@ -19,7 +19,7 @@ class Settings(BaseSettings):
     """
 
     DATABASE_URL: str = Field(
-        default="postgresql+psycopg2://postgres:Anton533@localhost:5432/Shop",
+        default="postgresql+psycopg2://postgres:password@localhost:5433/fastapi_shop",
         description="URL подключения к PostgreSQL",
     )
     CDN_BASE_URL: str = Field(default="", description="Базовый URL CDN для изображений")
