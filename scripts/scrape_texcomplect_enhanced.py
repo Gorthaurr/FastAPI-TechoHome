@@ -30,7 +30,7 @@ from app.db.models.product_attribute import ProductAttribute
 BASE_URL = "https://texcomplect.ru/"
 DELAY_SEC = 0.5
 MAX_WORKERS = 4
-MAX_PAGES_PER_CATEGORY = 50
+MAX_PAGES_PER_CATEGORY = 200
 
 HEADERS = {
     "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -262,7 +262,7 @@ def parse_product(session: requests.Session, url: str, category_slug: str, db: S
         existing_product = db.query(Product).filter(Product.id == product_id).first()
         if existing_product:
             print(f"  [SKIP] Product already exists: {name}")
-            return False
+            return "skipped"  # Возвращаем специальное значение для пропущенных товаров
 
         # Получаем или создаем категорию
         category = db.query(Category).filter(Category.slug == category_slug).first()
@@ -331,14 +331,15 @@ def parse_category(session: requests.Session, category_info: Dict[str, str], db:
             page_products = 0
             for link in product_links:
                 time.sleep(DELAY_SEC)
-                if parse_product(session, link, category_slug, db):
+                result = parse_product(session, link, category_slug, db)
+                if result == True:  # Только для действительно сохраненных товаров
                     page_products += 1
                     total_products += 1
             
             print(f"  [PAGE {page} SUMMARY] Products saved: {page_products}")
             
-            if page_products == 0:
-                break
+            # Убираем прерывание парсинга при отсутствии новых товаров
+            # Продолжаем парсинг до конца лимита страниц
                 
     except Exception as e:
         print(f"[ERR] parse_category failed for {category_name} :: {_err_kind(e)}")
