@@ -3,26 +3,25 @@
 """
 Парсер изображений товаров (DrissionPage)
 
-Логика на КАЖДУЮ картинку:
-1) По названию из БД открываем выдачу Яндекс.Картинок
-2) Кликаем плитку -> открывается модалка
-3) В модалке кликаем «Открыть»
-4) Скачиваем файл ЛОКАЛЬНО (с корректным Referer), проверяем минимальный размер
-5) Загружаем этот локальный файл в MinIO (механизм из «рабочей» версии), создаём запись в Postgres
-6) Удаляем локальный файл
-По 3 изображения на товар. Без ретраев.
+Ключевые свойства:
+- Браузер запускается скрыто (headless) с надёжными фоллбэками под разные версии DrissionPage/Chromium.
+- Никаких очисток MinIO/БД/локальных артефактов при старте.
+- Если у товара уже >= 3 изображений — пропуск.
+- Докачиваем недостающее количество.
+- Вся работа с изображениями идёт в памяти (BytesIO); НИКАКИХ локальных директорий 'downloaded_images' или 'html_dumps'.
 
-НОВОЕ: при запуске выполняется очистка:
-- MinIO (префикс products/)
-- Postgres (таблица product_images)
-- локальные артефакты (downloaded_images, html_dumps)
+Шаги на каждую картинку:
+1) По названию из БД — выдача Яндекс.Картинок
+2) Кликаем плитку -> модалка
+3) В модалке жмём «Открыть»
+4) Качаем файл В ПАМЯТЬ (с корректным Referer), валидируем размер
+5) Оптимизируем и грузим в MinIO, создаём запись в Postgres
 """
 
 import sys
 import os
 import re
 import time
-import shutil
 import warnings
 from io import BytesIO
 from datetime import datetime
@@ -56,6 +55,7 @@ from app.core.config import settings
 
 # ---------- DrissionPage ----------
 from DrissionPage import ChromiumPage
+from DrissionPage import ChromiumOptions
 from DrissionPage.common import Settings
 
 
@@ -63,10 +63,6 @@ from DrissionPage.common import Settings
 
 def _safe_filename(name: str) -> str:
     return re.sub(r'[^\w\s-]', '', name).strip().replace(' ', '_')
-
-
-def _ensure_dir(path: str):
-    os.makedirs(path, exist_ok=True)
 
 
 def _is_direct_image_url(url: str) -> bool:
@@ -109,7 +105,7 @@ def _origin(url: str) -> str:
 
 class QualityImageParser:
     def __init__(self, min_side: int = 300):
-        """Инициализация браузера, HTTP-сессии, MinIO+Postgres (запись включена)."""
+        """Инициализация HTTP-сессии, MinIO+Postgres (запись включена), подготовка браузера."""
         print("==================================================")
         print("STORAGE SERVICE INITIALIZATION")
         print("==================================================")
@@ -136,14 +132,12 @@ class QualityImageParser:
         })
 
         self.min_side = min_side
-        self.download_root = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'downloaded_images')
-        _ensure_dir(self.download_root)
+        # ВАЖНО: никаких локальных директорий — вся работа с байтами в памяти.
 
-    # -------------------- Очистка при запуске --------------------
+    # -------------------- (НЕ ИСПОЛЬЗУЕТСЯ) Очистка при запуске --------------------
 
     def clear_minio_products(self, prefix: str = 'products/'):
-        """Удаляет все объекты из MinIO с указанным префиксом."""
-        print("🗑️  Очистка MinIO...")
+        print("🗑️  Очистка MinIO (ручной вызов)...")
         try:
             s3 = boto3.client(
                 "s3",
@@ -158,12 +152,10 @@ class QualityImageParser:
             for page in paginator.paginate(Bucket=settings.S3_BUCKET_NAME, Prefix=prefix):
                 if 'Contents' not in page:
                     continue
-                # удаляем пачками до 1000
                 objs = [{'Key': obj['Key']} for obj in page['Contents']]
                 while objs:
                     batch = objs[:1000]
-                    del_request = {'Objects': batch, 'Quiet': True}
-                    s3.delete_objects(Bucket=settings.S3_BUCKET_NAME, Delete=del_request)
+                    s3.delete_objects(Bucket=settings.S3_BUCKET_NAME, Delete={'Objects': batch, 'Quiet': True})
                     total_deleted += len(batch)
                     objs = objs[1000:]
             if total_deleted:
@@ -174,8 +166,7 @@ class QualityImageParser:
             print(f"❌ Ошибка очистки MinIO: {e}")
 
     def clear_database_images(self):
-        """Удаляет все записи из product_images батчами."""
-        print("🗑️  Очистка записей в БД (product_images)...")
+        print("🗑️  Очистка записей в БД product_images (ручной вызов)...")
         try:
             with SessionLocal() as db:
                 before = db.query(ProductImage).count()
@@ -200,35 +191,57 @@ class QualityImageParser:
             print(f"❌ Ошибка очистки БД: {e}")
 
     def clear_local_artifacts(self):
-        """Удаляет локальные каталоги downloaded_images и html_dumps и создаёт их заново."""
-        print("🗑️  Очистка локальных артефактов...")
-        base_dir = os.path.dirname(os.path.abspath(__file__))
-        dirs = [
-            os.path.join(base_dir, 'downloaded_images'),
-            os.path.join(base_dir, 'html_dumps'),
-        ]
-        for d in dirs:
-            try:
-                if os.path.exists(d):
-                    shutil.rmtree(d, ignore_errors=True)
-                os.makedirs(d, exist_ok=True)
-                print(f"✅ Локально очищено и пересоздано: {d}")
-            except Exception as e:
-                print(f"❌ Ошибка очистки каталога {d}: {e}")
+        """Заглушка: локальные артефакты больше не используются и не создаются."""
+        print("ℹ️ Локальные артефакты не создаются — очищать нечего.")
 
     # -------------------- Браузер --------------------
 
     def init_page(self) -> bool:
         if self.page is None:
             try:
-                print("🌐 Инициализация DrissionPage...")
-                self.page = ChromiumPage()
+                print("🌐 Инициализация DrissionPage (headless)...")
+                co = ChromiumOptions()
+
+                # 1) Пытаемся включить headless через "современный" API
+                enabled = False
+                for m in ('set_headless', 'headless'):
+                    if hasattr(co, m):
+                        try:
+                            getattr(co, m)(True)  # co.set_headless(True) или co.headless(True)
+                            enabled = True
+                            break
+                        except Exception:
+                            pass
+
+                # 2) Если нет — фоллбэк на передачу аргументов
+                if not enabled:
+                    for flag in ('--headless=new', '--headless'):
+                        try:
+                            # У некоторых версий есть set_argument, у некоторых — только add_argument отсутствует.
+                            if hasattr(co, 'set_argument'):
+                                co.set_argument(flag)
+                                enabled = True
+                                break
+                        except Exception:
+                            continue
+
+                # Доп. надёжные флаги для контейнеров/VPS
+                for arg in ('--disable-gpu', '--no-sandbox', '--disable-dev-shm-usage', '--window-size=1920,1080'):
+                    try:
+                        if hasattr(co, 'set_argument'):
+                            co.set_argument(arg)
+                    except Exception:
+                        pass
+
+                self.page = ChromiumPage(co)
                 self.page.set.user_agent(self.session.headers['User-Agent'])
                 self.page.set.timeouts(base=10)
-                print("✅ DrissionPage инициализирован")
+                print("✅ DrissionPage инициализирован (скрыт)")
                 return True
             except Exception as e:
                 print(f"❌ Ошибка инициализации DrissionPage: {e}")
+                print("ℹ️ Проверьте установку Chromium/Chrome. При необходимости задайте путь вручную, например:")
+                print("   co = ChromiumOptions(); co.set_browser_path('/usr/bin/chromium')  # затем ChromiumPage(co)")
                 return False
         return True
 
@@ -242,15 +255,8 @@ class QualityImageParser:
                 pass
 
     def _dump_html(self, html: str, product_name: str, suffix: str):
-        try:
-            dump_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'html_dumps')
-            _ensure_dir(dump_dir)
-            path = os.path.join(dump_dir, f"{_safe_filename(product_name)}_{suffix}_{int(time.time())}.html")
-            with open(path, 'w', encoding='utf-8') as f:
-                f.write(html)
-            print(f"💾 HTML сохранен в {path}")
-        except Exception as e:
-            print(f"⚠️  Ошибка сохранения HTML: {e}")
+        """Заглушка: не сохраняем HTML на диск."""
+        return
 
     # -------------------- Шаг 1: открыть поиск --------------------
 
@@ -265,7 +271,6 @@ class QualityImageParser:
     # -------------------- Шаг 2: клик по плитке -> модалка --------------------
 
     def _wait_modal_opened(self, timeout: float = 4.0) -> bool:
-        """Ожидание признаков модалки (кнопка «Открыть», viewer-параметры, крупный IMG)."""
         end = time.time() + timeout
         last_url = None
         while time.time() < end:
@@ -286,7 +291,6 @@ class QualityImageParser:
         return False
 
     def _modal_img_element(self):
-        """Возвращает IMG из модалки, если находит, иначе None."""
         for sel in [
             'css:.MMImage-Origin img',
             'css:.MMImage img',
@@ -302,7 +306,6 @@ class QualityImageParser:
         return None
 
     def _best_modal_img_url(self) -> Optional[str]:
-        """Возвращает максимально крупный URL из модалки (srcset > src)."""
         for sel in [
             'css:.MMImage-Origin img',
             'css:.MMImage img',
@@ -341,7 +344,6 @@ class QualityImageParser:
         return None
 
     def _find_open_button_element(self):
-        """Ищем элемент «Открыть» максимально жёстко по тексту."""
         try:
             e = self.page.ele('xpath://a[normalize-space()="Открыть"]', timeout=0.3)
             if e: return e
@@ -361,7 +363,6 @@ class QualityImageParser:
         return None
 
     def _click_open_button_and_get_href(self) -> Optional[str]:
-        """Находит «Открыть», скроллит, кликает (обычно + JS), возвращает абсолютный href (если есть)."""
         btn = self._find_open_button_element()
         if not btn:
             print("⚠️  Не нашли «Открыть» — будем вытаскивать картинку из модалки")
@@ -384,7 +385,6 @@ class QualityImageParser:
         return href or None
 
     def _open_modal_by_tile_index(self, tile_index: int) -> bool:
-        """Кликает по плитке с указанным индексом (обновляя список каждый раз)."""
         selectors = [
             'css:a.ImagesContentImage-Cover',
             'css:.ImagesContent-Item a[href]',
@@ -415,13 +415,9 @@ class QualityImageParser:
                 continue
         return False
 
-    # -------------------- Шаг 4: скачать ЛОКАЛЬНО --------------------
+    # -------------------- Шаг 4: скачать В ПАМЯТЬ --------------------
 
-    def _download_to_local(self, url: str, referer: Optional[str], product_name: str, seq: int) -> Optional[str]:
-        """
-        Скачивает бинарь локально в ./downloaded_images/<товар>/img_XXX.<ext>
-        Валидирует минимальную сторону. Без ретраев. Возвращает путь на диске или None.
-        """
+    def _download_to_memory(self, url: str, referer: Optional[str]) -> Optional[BytesIO]:
         headers = self.session.headers.copy()
         if referer:
             headers['Referer'] = referer
@@ -430,16 +426,13 @@ class QualityImageParser:
             if origin:
                 headers['Referer'] = origin
 
-        print(f"📥 Скачиваем локально: {url}")
+        print(f"📥 Скачиваем в память: {url}")
         try:
             resp = self.session.get(url, headers=headers, timeout=25, verify=False, stream=True, allow_redirects=True)
             resp.raise_for_status()
         except requests.RequestException as e:
             print(f"❌ HTTP ошибка: {e}")
             return None
-
-        content_type = resp.headers.get('content-type', '')
-        ext = _guess_ext(url, content_type)
 
         data = BytesIO(resp.content)
         try:
@@ -453,30 +446,12 @@ class QualityImageParser:
             print(f"⚠️  PIL ошибка: {e}")
             return None
 
-        folder = os.path.join(self.download_root, _safe_filename(product_name))
-        _ensure_dir(folder)
-        filename = f"img_{seq:03d}{ext}"
-        local_path = os.path.join(folder, filename)
+        data.seek(0)
+        return data
 
-        try:
-            with open(local_path, 'wb') as f:
-                f.write(resp.content)
-            print(f"✅ Сохранено локально: {local_path}")
-            return local_path
-        except Exception as e:
-            print(f"❌ Не удалось сохранить файл: {e}")
-            return None
-
-    # -------------------- МЕХАНИЗМ ИЗ «РАБОЧЕЙ» ВЕРСИИ: MinIO + БД --------------------
+    # -------------------- MinIO + БД --------------------
 
     def optimize_and_save_image(self, image_data: BytesIO, product_id: str, filename: str) -> Optional[str]:
-        """
-        Оптимизировать и сохранить изображение в MinIO (как в «рабочей» версии):
-        - конвертация в JPEG
-        - thumbnail до 800x600
-        - storage_service.save_file(..., 'image/jpeg')
-        Возвращает storage_path или None.
-        """
         try:
             image_data.seek(0)
             with Image.open(image_data) as img:
@@ -505,7 +480,6 @@ class QualityImageParser:
 
     def create_image_record(self, db, product_id: str, storage_path: str,
                             is_primary: bool = False, alt_text: str = "") -> bool:
-        """Создание записи изображения в БД (как в «рабочей» версии)."""
         try:
             if is_primary:
                 existing_primary = db.query(ProductImage).filter(
@@ -538,20 +512,9 @@ class QualityImageParser:
             print(f"❌ Ошибка создания записи в БД: {e}")
             return False
 
-    def _upload_local_to_minio_and_record(self, local_path: str, product, seq: int) -> bool:
-        """
-        Читает локальный файл -> через optimize_and_save_image(...) сохраняет в MinIO как JPEG ->
-        создаёт запись в БД -> удаляет локальный файл.
-        """
-        filename = f"img_{seq:03d}.jpg"  # мы всегда конвертируем в JPEG
-        try:
-            with open(local_path, 'rb') as f:
-                data = BytesIO(f.read())
-        except Exception as e:
-            print(f"❌ Ошибка чтения локального файла: {e}")
-            return False
-
-        storage_path = self.optimize_and_save_image(data, str(product.id), filename)
+    def _upload_bytes_to_minio_and_record(self, image_data: BytesIO, product, seq: int) -> bool:
+        filename = f"img_{seq:03d}.jpg"  # всегда JPEG
+        storage_path = self.optimize_and_save_image(image_data, str(product.id), filename)
         if not storage_path:
             return False
 
@@ -563,25 +526,11 @@ class QualityImageParser:
                 is_primary=(seq == 1),
                 alt_text=f"Изображение товара {product.name}"
             )
-        if not ok:
-            return False
+        return ok
 
-        # Удаляем локальный файл после успешной записи
-        try:
-            os.remove(local_path)
-            print(f"🧹 Удалён локальный файл: {local_path}")
-        except Exception as e:
-            print(f"⚠️  Не удалось удалить локальный файл: {e}")
-
-        return True
-
-    # -------------------- Поиск лучшей ссылки для скачивания --------------------
+    # -------------------- Поиск лучшей ссылки --------------------
 
     def _largest_img_src_on_page(self) -> Optional[str]:
-        """
-        Если открылась страница не с raw-файлом, найдём КРУПНОЕ изображение.
-        Выбираем по srcset (max width), иначе по src.
-        """
         try:
             imgs = self.page.eles('css:img') or []
         except Exception:
@@ -613,13 +562,19 @@ class QualityImageParser:
                 continue
         return best_url
 
-    # -------------------- Основной цикл: 3 файла на товар --------------------
+    # -------------------- Подсчёт уже загруженных изображений --------------------
+
+    def _existing_images_count(self, product_id: str) -> int:
+        try:
+            with SessionLocal() as db:
+                return db.query(ProductImage).filter(ProductImage.product_id == product_id).count()
+        except Exception as e:
+            print(f"⚠️ Не удалось получить число изображений для продукта {product_id}: {e}")
+            return 0
+
+    # -------------------- Основной цикл: докачать до 3 файлов на товар --------------------
 
     def process_product(self, product: Product, images_per_product: int = 3) -> int:
-        """
-        Скачивает до images_per_product картинок для одного товара:
-        поиск → модалка → «Открыть» → локально → MinIO → БД → удалить локальный.
-        """
         print(f"\n🎯 Обрабатываем товар: '{product.name}' (ID: {product.id})")
         print("-" * 60)
 
@@ -627,22 +582,27 @@ class QualityImageParser:
             print("❌ Не удалось инициализировать браузер")
             return 0
 
-        # 1) Открыть выдачу и зафиксировать URL выдачи
+        existing = self._existing_images_count(product.id)
+        if existing >= images_per_product:
+            print(f"⏭️ Уже есть {existing} изображений (≥ {images_per_product}). Пропуск товара.")
+            return 0
+
+        need_to_save = images_per_product - existing
+        print(f"ℹ️  В БД уже: {existing}. Нужно докачать: {need_to_save}.")
+
         results_url = self.open_search_by_name(product.name)
 
         saved = 0
         tried = 0
         tile_index = 0
         downloaded_urls: Set[str] = set()
-        max_tile_attempts = images_per_product * 12  # запас по плиткам
+        max_tile_attempts = need_to_save * 12
 
-        while saved < images_per_product and tried < max_tile_attempts:
-            # Если ушли с выдачи — вернёмся
+        while saved < need_to_save and tried < max_tile_attempts:
             if not (self.page.url or "").startswith("https://yandex.ru/images"):
                 self.page.get(results_url)
                 time.sleep(0.6)
 
-            # 2) Клик по плитке по индексу -> ожидание модалки
             opened = self._open_modal_by_tile_index(tile_index)
             tried += 1
             tile_index += 1
@@ -651,13 +611,9 @@ class QualityImageParser:
                 print("⚠️  Плитка не открыла модалку — следующая")
                 continue
 
-            # Сохраняем лучший URL из модалки НА СЛУЧАЙ если «Открыть» не даст прямой файл
             modal_best_url = self._best_modal_img_url()
-
-            # 3) «Открыть» — строго клик, получаем href
             open_href = self._click_open_button_and_get_href()
 
-            # 4) Получаем конечный URL для скачивания и корректный Referer
             download_url = None
             referer_for_download = None
 
@@ -671,21 +627,17 @@ class QualityImageParser:
                     download_url = final_url
                     referer_for_download = _origin(final_url)
                 else:
-                    # Это страница — найдём самый крупный IMG
                     largest = self._largest_img_src_on_page()
                     if largest:
                         download_url = largest
                         referer_for_download = self.page.url
 
-            # Если ничего не вышло — fallback на картинку из модалки
             if not download_url and modal_best_url:
                 download_url = modal_best_url
                 referer_for_download = _origin(modal_best_url) or 'https://yandex.ru/'
 
             if not download_url:
-                self._dump_html(self.page.html or "", product.name, f"no_image_to_download_{saved+1}")
                 print("❌ Не удалось получить ссылку на картинку — следующая плитка")
-                # Вернёмся на выдачу
                 self.page.get(results_url)
                 time.sleep(0.6)
                 continue
@@ -696,34 +648,31 @@ class QualityImageParser:
                 time.sleep(0.6)
                 continue
 
-            print(f"🔗 Будем скачивать (локально): {download_url}")
+            seq = existing + saved + 1
+            print(f"🔗 Будем скачивать (в память): {download_url} -> seq={seq}")
 
-            # Локально качаем файл
-            local_path = self._download_to_local(download_url, referer_for_download, product.name, seq=saved + 1)
+            img_bytes = self._download_to_memory(download_url, referer_for_download)
 
-            # Возврат на выдачу для следующей плитки
             self.page.get(results_url)
             time.sleep(0.6)
 
-            if not local_path:
-                print("⚠️  Не удалось скачать локально — следующая плитка")
+            if not img_bytes:
+                print("⚠️  Не удалось скачать в память — следующая плитка")
                 continue
 
-            # Заливка в MinIO (механизм из рабочей версии) + запись в БД + удаление локального
-            if self._upload_local_to_minio_and_record(local_path, product, seq=saved + 1):
+            if self._upload_bytes_to_minio_and_record(img_bytes, product, seq=seq):
                 saved += 1
                 downloaded_urls.add(download_url)
-                print(f"📈 Прогресс по товару: {saved}/{images_per_product}")
+                print(f"📈 Прогресс по товару: {existing + saved}/{images_per_product}")
             else:
                 print("⚠️  Не удалось загрузить в MinIO/записать в БД — следующая плитка")
 
-        print(f"\n✅ Сохранено изображений для товара: {saved}/{images_per_product}")
+        print(f"\n✅ Сохранено изображений для товара: {saved}/{need_to_save} (итог в БД будет {existing + saved})")
         return saved
 
     # -------------------- Получение товаров из БД --------------------
 
     def get_products_from_db(self) -> List[Product]:
-        """Берём товары из БД (без жадных связей)."""
         try:
             print("📦 Получаем товары из БД...")
             with SessionLocal() as db:
@@ -743,36 +692,13 @@ class QualityImageParser:
 # ========================= main =========================
 
 def main():
-    print("🚀 ПАРСЕР ИЗОБРАЖЕНИЙ — локально → MinIO (рабочий механизм) → запись в Postgres → удаление локального")
+    print("🚀 ПАРСЕР ИЗОБРАЖЕНИЙ — в память → MinIO (рабочий механизм) → запись в Postgres")
     print("=" * 94)
-    print("Шаги: поиск → модалка → «Открыть» → локально → MinIO → БД → удалить локальный (3 изображения на товар)\n")
+    print("Шаги: поиск → модалка → «Открыть» → в память → MinIO → БД (до 3 изображений на товар)\n")
 
     parser = QualityImageParser(min_side=300)
 
     try:
-        # ----- ОЧИСТКА ПРИ ЗАПУСКЕ -----
-        print("🧯 НАЧИНАЕМ ОЧИСТКУ ПРИ ЗАПУСКЕ")
-        # До очистки — просто статистика по БД
-        try:
-            with SessionLocal() as db:
-                before_count = db.query(ProductImage).count()
-                print(f"📊 В БД product_images до очистки: {before_count}")
-        except Exception as e:
-            print(f"⚠️  Не удалось получить статистику по БД: {e}")
-
-        parser.clear_minio_products(prefix='products/')
-        parser.clear_database_images()
-        parser.clear_local_artifacts()
-
-        # После очистки — проверка
-        try:
-            with SessionLocal() as db:
-                after_count = db.query(ProductImage).count()
-                print(f"📊 В БД product_images после очистки: {after_count}")
-        except Exception as e:
-            print(f"⚠️  Не удалось получить статистику по БД после очистки: {e}")
-
-        # ----- ПАРСИНГ -----
         products = parser.get_products_from_db()
         if not products:
             print("❌ В БД нет товаров")
