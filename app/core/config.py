@@ -45,7 +45,7 @@ class Settings(BaseSettings):
     )
     AWS_REGION: str = Field(default="us-east-1", description="AWS регион для S3")
     S3_ENDPOINT_URL: str = Field(
-        default="http://localhost:9002",
+        default="http://localhost:9000",
         description="Кастомный endpoint URL для S3 (для MinIO и т.д.)",
     )
     AWS_ACCESS_KEY_ID: str = Field(

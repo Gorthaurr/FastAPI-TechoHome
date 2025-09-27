@@ -47,7 +47,7 @@ class LocalCDNService:
         """Получить CDN URL для файла."""
         if not self.cdn_base_url:
             # Локальный CDN
-            base_url = "http://localhost:8000/cdn"
+            base_url = f"{settings.CDN_BASE_URL or 'http://localhost:8000'}/cdn"
         else:
             base_url = self.cdn_base_url
 

@@ -8,14 +8,14 @@
 - Никаких очисток MinIO/БД/локальных артефактов при старте.
 - Если у товара уже >= 3 изображений — пропуск.
 - Докачиваем недостающее количество.
-- Вся работа с изображениями идёт в памяти (BytesIO); НИКАКИХ локальных директорий 'downloaded_images' или 'html_dumps'.
+- Основной режим: файлы сохраняются во временную папку 'downloaded_images' и УДАЛЯЮТСЯ сразу после загрузки в MinIO.
 
 Шаги на каждую картинку:
 1) По названию из БД — выдача Яндекс.Картинок
 2) Кликаем плитку -> модалка
 3) В модалке жмём «Открыть»
-4) Качаем файл В ПАМЯТЬ (с корректным Referer), валидируем размер
-5) Оптимизируем и грузим в MinIO, создаём запись в Postgres
+4) Качаем файл СТРИМОМ НА ДИСК (с корректным Referer), валидируем размер БЕЗ полного декодирования
+5) Оптимизируем и грузим в MinIO, создаём запись в Postgres, удаляем локальный файл
 """
 
 import sys
@@ -31,6 +31,9 @@ from urllib.parse import quote, urljoin, urlparse
 import requests
 import urllib3
 from PIL import Image
+
+# Ограничитель на сверхбольшие изображения (страховка от гигапикселей)
+Image.MAX_IMAGE_PIXELS = 120_000_000  # ~120 МП, при желании уменьшите
 
 # S3 / MinIO
 import boto3
@@ -132,7 +135,10 @@ class QualityImageParser:
         })
 
         self.min_side = min_side
-        # ВАЖНО: никаких локальных директорий — вся работа с байтами в памяти.
+
+        # Локальная папка для временных загрузок (удаляем файлы после загрузки в MinIO)
+        self.download_dir = os.path.join(os.getcwd(), "downloaded_images")
+        os.makedirs(self.download_dir, exist_ok=True)
 
     # -------------------- (НЕ ИСПОЛЬЗУЕТСЯ) Очистка при запуске --------------------
 
@@ -191,8 +197,8 @@ class QualityImageParser:
             print(f"❌ Ошибка очистки БД: {e}")
 
     def clear_local_artifacts(self):
-        """Заглушка: локальные артефакты больше не используются и не создаются."""
-        print("ℹ️ Локальные артефакты не создаются — очищать нечего.")
+        """Заглушка: локальные артефакты больше не используются и не создаются напрямую, кроме временных файлов."""
+        print("ℹ️ Локальные артефакты создаются временно в 'downloaded_images' и удаляются после загрузки.")
 
     # -------------------- Браузер --------------------
 
@@ -217,7 +223,6 @@ class QualityImageParser:
                 if not enabled:
                     for flag in ('--headless=new', '--headless'):
                         try:
-                            # У некоторых версий есть set_argument, у некоторых — только add_argument отсутствует.
                             if hasattr(co, 'set_argument'):
                                 co.set_argument(flag)
                                 enabled = True
@@ -415,7 +420,7 @@ class QualityImageParser:
                 continue
         return False
 
-    # -------------------- Шаг 4: скачать В ПАМЯТЬ --------------------
+    # -------------------- Шаг 4: скачать В ПАМЯТЬ (оставлено для совместимости, не используется по умолчанию) --------------------
 
     def _download_to_memory(self, url: str, referer: Optional[str]) -> Optional[BytesIO]:
         headers = self.session.headers.copy()
@@ -437,6 +442,7 @@ class QualityImageParser:
         data = BytesIO(resp.content)
         try:
             with Image.open(data) as im:
+                # Для памяти — принудительное load(), но этот путь сейчас не используется
                 im.load()
                 w, h = im.size
                 if min(w, h) < self.min_side:
@@ -449,9 +455,78 @@ class QualityImageParser:
         data.seek(0)
         return data
 
+    # -------------------- Шаг 4b: скачать В ФАЙЛ (основной путь) --------------------
+
+    def _download_to_file(self, url: str, referer: Optional[str]) -> Optional[str]:
+        headers = self.session.headers.copy()
+        if referer:
+            headers['Referer'] = referer
+        else:
+            origin = _origin(url)
+            if origin:
+                headers['Referer'] = origin
+
+        try:
+            os.makedirs(self.download_dir, exist_ok=True)
+        except Exception:
+            pass
+
+        ts = int(time.time() * 1000)
+        tmp_name = f"dl_{ts}_{os.getpid()}"
+
+        # Угадываем расширение заранее
+        try:
+            head = self.session.head(url, headers=headers, timeout=10, verify=False, allow_redirects=True)
+            ct = head.headers.get("Content-Type", "")
+        except Exception:
+            ct = ""
+        ext = _guess_ext(url, ct) or ".jpg"
+        file_path = os.path.join(self.download_dir, tmp_name + ext)
+
+        print(f"📥 Скачиваем в файл: {url} -> {file_path}")
+        try:
+            with self.session.get(url, headers=headers, timeout=25, verify=False, stream=True, allow_redirects=True) as r:
+                r.raise_for_status()
+                with open(file_path, "wb") as f:
+                    for chunk in r.iter_content(chunk_size=1024 * 128):
+                        if chunk:
+                            f.write(chunk)
+        except requests.RequestException as e:
+            print(f"❌ HTTP ошибка: {e}")
+            try:
+                if os.path.exists(file_path):
+                    os.remove(file_path)
+            except Exception:
+                pass
+            return None
+
+        # Валидация размеров без полного декодирования (size читается из заголовка)
+        try:
+            with Image.open(file_path) as im:
+                w, h = im.size  # без im.load()
+                if min(w, h) < self.min_side:
+                    print(f"⚠️  Слишком маленькое: {w}x{h} (<{self.min_side})")
+                    os.remove(file_path)
+                    return None
+                # Предохранитель от «гигантов»
+                if (w * h) > 40_000_000:  # > 40 МП — скип
+                    print(f"⚠️  Слишком большое изображение {w}x{h} (>40 МП) — пропуск")
+                    os.remove(file_path)
+                    return None
+        except Exception as e:
+            print(f"⚠️  PIL ошибка: {e}")
+            try:
+                os.remove(file_path)
+            except Exception:
+                pass
+            return None
+
+        return file_path
+
     # -------------------- MinIO + БД --------------------
 
     def optimize_and_save_image(self, image_data: BytesIO, product_id: str, filename: str) -> Optional[str]:
+        """Оставлено для обратной совместимости; основной путь — из файла."""
         try:
             image_data.seek(0)
             with Image.open(image_data) as img:
@@ -474,6 +549,43 @@ class QualityImageParser:
                     return None
                 print(f"✅ Изображение сохранено в MinIO: {storage_path}")
                 return storage_path
+        except Exception as e:
+            print(f"❌ Ошибка обработки/сохранения в MinIO: {e}")
+            return None
+
+    def optimize_and_save_image_from_file(self, file_path: str, product_id: str, filename: str) -> Optional[str]:
+        """Оптимизация с диска: draft() для JPEG, конверт в RGB, thumbnail -> JPEG в буфер -> MinIO."""
+        try:
+            with Image.open(file_path) as img:
+                # draft() уменьшает декодируемые данные для больших JPEG
+                try:
+                    if (img.format or '').upper() == 'JPEG':
+                        img.draft('RGB', (800, 600))
+                except Exception:
+                    pass
+
+                if img.mode in ('RGBA', 'P'):
+                    img = img.convert('RGB')
+                elif img.mode != 'RGB':
+                    img = img.convert('RGB')
+
+                img.thumbnail((800, 600), Image.Resampling.LANCZOS)
+
+                output_buffer = BytesIO()
+                img.save(output_buffer, format='JPEG', quality=85, optimize=True)
+
+            storage_path = f"products/{product_id[:12]}/{filename}"
+            output_buffer.seek(0)
+            success = storage_service.save_file(
+                storage_path,
+                output_buffer,
+                "image/jpeg"
+            )
+            if not success:
+                print("❌ storage_service вернул False")
+                return None
+            print(f"✅ Изображение сохранено в MinIO: {storage_path}")
+            return storage_path
         except Exception as e:
             print(f"❌ Ошибка обработки/сохранения в MinIO: {e}")
             return None
@@ -513,11 +625,11 @@ class QualityImageParser:
             return False
 
     def _upload_bytes_to_minio_and_record(self, image_data: BytesIO, product, seq: int) -> bool:
+        """Старый путь: из памяти. Сейчас не используется по умолчанию."""
         filename = f"img_{seq:03d}.jpg"  # всегда JPEG
         storage_path = self.optimize_and_save_image(image_data, str(product.id), filename)
         if not storage_path:
             return False
-
         with SessionLocal() as db:
             ok = self.create_image_record(
                 db=db,
@@ -527,6 +639,29 @@ class QualityImageParser:
                 alt_text=f"Изображение товара {product.name}"
             )
         return ok
+
+    def _upload_file_to_minio_and_record(self, file_path: str, product, seq: int) -> bool:
+        """Новый путь: из файла. ВСЕГДА удаляет локальный файл в finally."""
+        filename = f"img_{seq:03d}.jpg"  # всегда JPEG
+        try:
+            storage_path = self.optimize_and_save_image_from_file(file_path, str(product.id), filename)
+            if not storage_path:
+                return False
+            with SessionLocal() as db:
+                ok = self.create_image_record(
+                    db=db,
+                    product_id=product.id,
+                    storage_path=storage_path,
+                    is_primary=(seq == 1),
+                    alt_text=f"Изображение товара {product.name}"
+                )
+            return ok
+        finally:
+            try:
+                if os.path.exists(file_path):
+                    os.remove(file_path)
+            except Exception:
+                pass
 
     # -------------------- Поиск лучшей ссылки --------------------
 
@@ -649,18 +784,18 @@ class QualityImageParser:
                 continue
 
             seq = existing + saved + 1
-            print(f"🔗 Будем скачивать (в память): {download_url} -> seq={seq}")
+            print(f"🔗 Будем скачивать (в файл): {download_url} -> seq={seq}")
 
-            img_bytes = self._download_to_memory(download_url, referer_for_download)
+            file_path = self._download_to_file(download_url, referer_for_download)
 
             self.page.get(results_url)
             time.sleep(0.6)
 
-            if not img_bytes:
-                print("⚠️  Не удалось скачать в память — следующая плитка")
+            if not file_path:
+                print("⚠️  Не удалось скачать в файл — следующая плитка")
                 continue
 
-            if self._upload_bytes_to_minio_and_record(img_bytes, product, seq=seq):
+            if self._upload_file_to_minio_and_record(file_path, product, seq=seq):
                 saved += 1
                 downloaded_urls.add(download_url)
                 print(f"📈 Прогресс по товару: {existing + saved}/{images_per_product}")
@@ -692,9 +827,9 @@ class QualityImageParser:
 # ========================= main =========================
 
 def main():
-    print("🚀 ПАРСЕР ИЗОБРАЖЕНИЙ — в память → MinIO (рабочий механизм) → запись в Postgres")
+    print("🚀 ПАРСЕР ИЗОБРАЖЕНИЙ — файл → MinIO → запись в Postgres (с авто-удалением локальных файлов)")
     print("=" * 94)
-    print("Шаги: поиск → модалка → «Открыть» → в память → MinIO → БД (до 3 изображений на товар)\n")
+    print("Шаги: поиск → модалка → «Открыть» → файл → MinIO → БД (до 3 изображений на товар)\n")
 
     parser = QualityImageParser(min_side=300)
 

@@ -196,7 +196,7 @@ class MinIOStorageProvider(StorageProvider):
             endpoint_url: URL MinIO сервера
         """
         self.bucket_name = bucket_name
-        self.endpoint_url = endpoint_url or "http://localhost:9000"
+        self.endpoint_url = endpoint_url or settings.S3_ENDPOINT_URL or "http://localhost:9000"
         self.access_key = settings.AWS_ACCESS_KEY_ID
         self.secret_key = settings.AWS_SECRET_ACCESS_KEY
         
