@@ -7,7 +7,7 @@ from typing import List, Optional
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, UploadFile, status
-from sqlalchemy import and_, desc, func, or_
+from sqlalchemy import and_, desc, func, or_, select
 from sqlalchemy.orm import Session
 
 from app.core.auth import (
@@ -20,6 +20,7 @@ from app.db.database import get_db
 from app.db.models.category import Category
 from app.db.models.order import Order, OrderItem
 from app.db.models.product import Product
+from app.db.models.product_attribute import ProductAttribute
 from app.db.models.product_image import ProductImage
 from app.db.models.user import User
 from app.schemas.admin import (
@@ -771,7 +772,7 @@ async def admin_list_products(
         count_stmt = count_stmt.where(where_clause)
     total = db.scalar(count_stmt) or 0
 
-    # Основной запрос - загружаем все поля для админки
+    # Основной запрос без лишних JOIN'ов
     stmt = select(Product)
     if where_clause is not None:
         stmt = stmt.where(where_clause)
@@ -1494,6 +1495,45 @@ async def get_system_settings(
     """
     # Здесь можно добавить логику получения настроек из БД
     return SystemSettings()
+
+
+@router.post("/products/{product_id}/attributes")
+async def admin_add_product_attribute(
+    product_id: str,
+    attr_key: str = Form(...),
+    value: str = Form(...),
+    current_user: User = Depends(require_admin),
+    db: Session = Depends(get_db),
+):
+    """
+    Добавить атрибут к товару.
+    """
+    # Проверяем существование товара
+    product = db.scalar(select(Product).where(Product.id == product_id))
+    if not product:
+        raise HTTPException(404, detail="Product not found")
+    
+    try:
+        # Создаем новый атрибут
+        new_attribute = ProductAttribute(
+            product_id=product_id,
+            attr_key=attr_key,
+            value=value
+        )
+        
+        db.add(new_attribute)
+        db.commit()
+        db.refresh(new_attribute)
+        
+        return {
+            "id": new_attribute.id,
+            "attr_key": new_attribute.attr_key,
+            "value": new_attribute.value
+        }
+        
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(500, detail=f"Failed to add attribute: {str(e)}")
 
 
 @router.put("/settings")
