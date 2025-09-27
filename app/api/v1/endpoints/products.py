@@ -26,7 +26,7 @@ SortField = Literal["name", "-name", "price", "-price"]
 def list_products(
     db: Session = Depends(get_db),
     page: int = Query(1, ge=1, description="Номер страницы"),
-    page_size: int = Query(20, ge=1, le=100, description="Размер страницы"),
+    page_size: int = Query(20, ge=1, le=20, description="Размер страницы"),
     category_id: Optional[int] = Query(None, description="Фильтр по категории"),
     q: Optional[str] = Query(None, description="Поиск по названию (ILIKE)"),
     price_min: Optional[int] = Query(
@@ -84,16 +84,21 @@ def list_products(
         count_stmt = count_stmt.where(where_clause)
     total = db.scalar(count_stmt) or 0
 
-    # Основной запрос
-    stmt = select(Product)
+    # Основной запрос - ОПТИМИЗИРОВАННЫЙ с JOIN для изображений (только главное)
+    if include_images:
+        from app.db.models import ProductImage
+        stmt = select(Product).outerjoin(
+            ProductImage, 
+            and_(
+                Product.id == ProductImage.product_id,
+                ProductImage.is_primary == True
+            )
+        )
+    else:
+        stmt = select(Product)
+    
     if where_clause is not None:
         stmt = stmt.where(where_clause)
-
-    # Предзагрузка связей (чтобы избежать ленивых обращений)
-    if include_images:
-        stmt = stmt.options(selectinload(Product.images))
-    if include_attributes:
-        stmt = stmt.options(selectinload(Product.attributes))
 
     # Сортировка
     if sort in ("name", "-name"):
@@ -107,7 +112,8 @@ def list_products(
         )
     stmt = stmt.order_by(order)
 
-    # Пагинация
+    # Пагинация - с жестким лимитом для предотвращения медленных запросов
+    page_size = min(page_size, 20)  # Максимум 20 товаров на страницу
     offset = (page - 1) * page_size
     rows = db.scalars(stmt.offset(offset).limit(page_size)).all()
 
@@ -124,38 +130,69 @@ def list_products(
             "description": product.description,
         }
 
-        # Добавление изображений
+        # Добавление изображений - ТОЛЬКО ГЛАВНОЕ для производительности
         if include_images:
-            images = sorted(
-                product.images, key=lambda x: (not x.is_primary, x.sort_order, x.id)
-            )
+            # Ищем главное изображение из JOIN'а
+            primary_image = None
+            for attr_name in dir(product):
+                if 'image' in attr_name.lower() and hasattr(getattr(product, attr_name), 'is_primary'):
+                    img = getattr(product, attr_name)
+                    if img and img.is_primary:
+                        primary_image = img
+                        break
+            
+            # Если не нашли в JOIN, делаем быстрый запрос только для главного изображения
+            if not primary_image:
+                from app.db.models import ProductImage
+                img_stmt = select(ProductImage).where(
+                    and_(
+                        ProductImage.product_id == product.id,
+                        ProductImage.is_primary == True
+                    )
+                ).limit(1)
+                primary_image = db.scalar(img_stmt)
+            
             item["images"] = []
-            for img in images:
-                # Используем storage_service для генерации presigned URL
-                presigned_url = storage_service.get_file_url(img.path)
+            if primary_image:
+                presigned_url = storage_service.get_file_url(primary_image.path)
                 image_data = {
-                    "id": img.id,
-                    "path": img.path,
-                    "filename": img.filename,
-                    "sort_order": img.sort_order,
-                    "is_primary": img.is_primary,
-                    "status": img.status,
+                    "id": primary_image.id,
+                    "path": primary_image.path,
+                    "filename": primary_image.filename,
+                    "sort_order": primary_image.sort_order,
+                    "is_primary": primary_image.is_primary,
+                    "status": primary_image.status,
                     "url": presigned_url,
                     "urls": {"original": presigned_url},
-                    "file_size": img.file_size,
-                    "mime_type": img.mime_type,
-                    "width": img.width,
-                    "height": img.height,
-                    "alt_text": img.alt_text,
+                    "file_size": primary_image.file_size,
+                    "mime_type": primary_image.mime_type,
+                    "width": primary_image.width,
+                    "height": primary_image.height,
+                    "alt_text": primary_image.alt_text,
                 }
                 item["images"].append(image_data)
+        else:
+            item["images"] = []
 
-        # Добавление атрибутов
+        # Добавление атрибутов - ТОЛЬКО ОСНОВНЫЕ для производительности
         if include_attributes:
+            # Загружаем только ключевые атрибуты для списка товаров
+            from app.db.models import ProductAttribute
+            attr_stmt = select(ProductAttribute).where(
+                and_(
+                    ProductAttribute.product_id == product.id,
+                    ProductAttribute.attr_key.in_([
+                        'brand', 'model', 'color', 'size', 'material', 'weight'
+                    ])  # Только основные атрибуты для списка
+                )
+            ).limit(5)  # Максимум 5 атрибутов
+            attributes = db.scalars(attr_stmt).all()
             item["attributes"] = [
                 {"id": attr.id, "key": attr.attr_key, "value": attr.value}
-                for attr in product.attributes
+                for attr in attributes
             ]
+        else:
+            item["attributes"] = []
 
         items.append(item)
 

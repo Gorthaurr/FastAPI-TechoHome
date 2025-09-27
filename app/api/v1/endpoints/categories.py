@@ -6,6 +6,7 @@ API endpoints для работы с категориями товаров.
 """
 
 from typing import List
+import time
 
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy import select
@@ -16,14 +17,19 @@ from app.db.models import Category
 
 router = APIRouter()
 
+# Простое in-memory кэширование для категорий
+_categories_cache = None
+_cache_timestamp = 0
+CACHE_TTL = 300  # 5 минут
+
 
 @router.get("", response_model=List[dict])
 def list_categories(db: Session = Depends(get_db)):
     """
-    Получить список всех категорий.
+    Получить список всех категорий с кэшированием.
 
     Возвращает отсортированный по slug список всех доступных
-    категорий товаров в системе.
+    категорий товаров в системе с кэшированием на 5 минут.
 
     Args:
         db: Сессия базы данных
@@ -37,8 +43,22 @@ def list_categories(db: Session = Depends(get_db)):
             {"id": 2, "slug": "home-appliances"}
         ]
     """
-    rows = db.scalars(select(Category).order_by(Category.slug)).all()
-    return [{"id": c.id, "slug": c.slug} for c in rows]
+    global _categories_cache, _cache_timestamp
+    
+    # Проверяем кэш
+    current_time = time.time()
+    if _categories_cache and (current_time - _cache_timestamp) < CACHE_TTL:
+        return _categories_cache
+    
+    # Загружаем из БД - ТОЛЬКО НУЖНЫЕ ПОЛЯ для скорости
+    rows = db.execute(select(Category.id, Category.slug).order_by(Category.slug)).all()
+    result = [{"id": row.id, "slug": row.slug} for row in rows]
+    
+    # Обновляем кэш
+    _categories_cache = result
+    _cache_timestamp = current_time
+    
+    return result
 
 
 @router.get("/{category_id}", response_model=dict)

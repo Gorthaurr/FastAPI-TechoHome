@@ -79,7 +79,15 @@ except Exception as e:
 # Настройка CORS middleware
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # TODO: сузить в продакшене до конкретных доменов
+    allow_origins=[
+        "http://localhost:3000",    # React dev server (Create React App)
+        "http://localhost:5173",    # Vite dev server
+        "http://localhost:4173",    # Vite preview
+        "http://127.0.0.1:3000",   # Alternative localhost
+        "http://127.0.0.1:5173",   # Alternative localhost
+        "http://localhost:8000",    # Same origin для тестов
+        "*"  # Временно для всех (убрать в продакшене)
+    ],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],

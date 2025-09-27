@@ -771,7 +771,7 @@ async def admin_list_products(
         count_stmt = count_stmt.where(where_clause)
     total = db.scalar(count_stmt) or 0
 
-    # Основной запрос без лишних JOIN'ов
+    # Основной запрос - загружаем все поля для админки
     stmt = select(Product)
     if where_clause is not None:
         stmt = stmt.where(where_clause)
