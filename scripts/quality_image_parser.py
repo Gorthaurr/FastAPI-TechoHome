@@ -1,55 +1,51 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
+
+# ==== ГЛОБАЛЬНЫЙ UTF-8 РЕЖИМ (фикс UnicodeDecodeError на Windows консоли/подпроцессах) ====
+import os as _os
+_os.environ.setdefault("PYTHONUTF8", "1")
+_os.environ.setdefault("PYTHONIOENCODING", "UTF-8")
+
 """
-Парсер изображений товаров (DrissionPage)
+Парсер изображений товаров без модалки (DrissionPage)
 
-Ключевые свойства:
-- Браузер запускается скрыто (headless) с надёжными фоллбэками под разные версии DrissionPage/Chromium.
-- Никаких очисток MinIO/БД/локальных артефактов при старте.
-- Если у товара уже >= 3 изображений — пропуск.
-- Докачиваем недостающее количество.
-- Основной режим: файлы сохраняются во временную папку 'downloaded_images' и УДАЛЯЮТСЯ сразу после загрузки в MinIO.
+Главные изменения:
+- НИКАКОГО viewer/modal. Берём кандидаты прямо с выдачи (anchors с ?img_url=).
+- Собираем N*K кандидатов через скролл, вынимаем оригинальные URL из img_url,
+  отбрасываем дубликаты, валидируем заголовки и сигнатуры, скачиваем.
+- Подбираем корректный Referer под домены (mvideo/ozon/yandex/wb/leroy и т.д.).
+- Батч-запрос товаров с недостающими фото, timezone-aware даты.
+- HTTP pooling + retries, tuple-таймауты, разгрузка DOM.
 
-Шаги на каждую картинку:
-1) По названию из БД — выдача Яндекс.Картинок
-2) Кликаем плитку -> модалка
-3) В модалке жмём «Открыть»
-4) Качаем файл СТРИМОМ НА ДИСК (с корректным Referer), валидируем размер БЕЗ полного декодирования
-5) Оптимизируем и грузим в MinIO, создаём запись в Postgres, удаляем локальный файл
 """
 
 import sys
-import os
 import re
+import gc
 import time
 import warnings
 from io import BytesIO
-from datetime import datetime
-from typing import List, Optional, Set, Dict
-from urllib.parse import quote, urljoin, urlparse
+from datetime import datetime, timezone
+from typing import List, Optional, Set, Dict, Tuple
+from urllib.parse import quote, urljoin, urlparse, parse_qs, unquote
 
 import requests
 import urllib3
 from PIL import Image
 
-# Ограничитель на сверхбольшие изображения (страховка от гигапикселей)
-Image.MAX_IMAGE_PIXELS = 120_000_000  # ~120 МП, при желании уменьшите
-
-# S3 / MinIO
-import boto3
-from botocore.client import Config
-from botocore.exceptions import ClientError
+Image.MAX_IMAGE_PIXELS = 120_000_000  # ~120 МП
 
 # ---------- Отключение SSL-предупреждений ----------
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 warnings.filterwarnings('ignore', message='Unverified HTTPS request')
 
 # ---------- Пути/окружение проекта ----------
+import os
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 os.environ.setdefault('STORAGE_TYPE', 's3')
 os.environ.setdefault('DATABASE_URL', 'postgresql+psycopg2://postgres:password@localhost:5433/fastapi_shop')
 
-# ---------- Импорты проекта ----------
+# ---------- Проектные импорты ----------
 from app.db.database import SessionLocal
 from app.db.models.product import Product
 from app.db.models.product_image import ProductImage
@@ -57,37 +53,30 @@ from app.services.storage_service import storage_service
 from app.core.config import settings
 
 # ---------- DrissionPage ----------
-from DrissionPage import ChromiumPage
-from DrissionPage import ChromiumOptions
+from DrissionPage import ChromiumPage, ChromiumOptions
 from DrissionPage.common import Settings
 
+# ---------- HTTP pooling/retry ----------
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
-# ========================= ВСПОМОГАТЕЛЬНОЕ =========================
 
-def _safe_filename(name: str) -> str:
-    return re.sub(r'[^\w\s-]', '', name).strip().replace(' ', '_')
-
+# ========================= УТИЛИТЫ =========================
 
 def _is_direct_image_url(url: str) -> bool:
-    return bool(re.search(r'\.(jpg|jpeg|png|webp|gif|bmp|tiff)(\?|$)', url, flags=re.I))
+    return bool(re.search(r'\.(jpg|jpeg|png|webp|gif|bmp|tif|tiff)(\?|$)', url, flags=re.I))
 
 
 def _guess_ext(url: str, content_type: str) -> str:
     u = (url or '').lower()
-    if u.endswith('.jpg') or u.endswith('.jpeg'):
-        return '.jpg'
-    if u.endswith('.png'):
-        return '.png'
-    if u.endswith('.webp'):
-        return '.webp'
-    if u.endswith('.gif'):
-        return '.gif'
-    if u.endswith('.bmp'):
-        return '.bmp'
-    if u.endswith('.tif') or u.endswith('.tiff'):
-        return '.tiff'
+    if u.endswith(('.jpg', '.jpeg')): return '.jpg'
+    if u.endswith('.png'):  return '.png'
+    if u.endswith('.webp'): return '.webp'
+    if u.endswith('.gif'):  return '.gif'
+    if u.endswith('.bmp'):  return '.bmp'
+    if u.endswith(('.tif', '.tiff')): return '.tiff'
     if content_type:
-        ct = content_type.lower()
+        ct = (content_type or '').lower()
         if 'jpeg' in ct: return '.jpg'
         if 'png'  in ct: return '.png'
         if 'webp' in ct: return '.webp'
@@ -104,11 +93,57 @@ def _origin(url: str) -> str:
     return f'{p.scheme}://{p.netloc}/'
 
 
+def _domain_referer(url: str, fallback: Optional[str] = None) -> Optional[str]:
+    """Подбираем корректный Referer для капризных CDN."""
+    host = (urlparse(url).netloc or '').lower()
+    if host.endswith('mvideo.ru'):
+        return 'https://www.mvideo.ru/'
+    if host.endswith('ozone.ru'):
+        return 'https://www.ozon.ru/'
+    if host.endswith('yandex.net') or host.endswith('yandex.ru'):
+        return 'https://yandex.ru/images/'
+    if host.endswith('wildberries.ru'):
+        return 'https://www.wildberries.ru/'
+    if host.endswith('leroymerlin.ru'):
+        return 'https://leroymerlin.ru/'
+    return fallback
+
+
+def _magic_image_type(header16: bytes) -> Optional[str]:
+    """Определяем тип по сигнатуре (первые 16 байт)."""
+    if len(header16) < 8:
+        return None
+    b = header16
+    # JPEG
+    if b[:2] == b'\xFF\xD8':
+        return 'jpeg'
+    # PNG
+    if b[:8] == b'\x89PNG\r\n\x1a\n':
+        return 'png'
+    # GIF87a/GIF89a
+    if b[:6] in (b'GIF87a', b'GIF89a'):
+        return 'gif'
+    # WEBP: RIFF....WEBP
+    if b[:4] == b'RIFF' and b[8:12] == b'WEBP':
+        return 'webp'
+    # BMP
+    if b[:2] == b'BM':
+        return 'bmp'
+    # TIFF
+    if b[:4] in (b'II*\x00', b'MM\x00*'):
+        return 'tiff'
+    return None
+
+
 # ========================= ОСНОВНОЙ КЛАСС =========================
 
 class QualityImageParser:
-    def __init__(self, min_side: int = 300):
-        """Инициализация HTTP-сессии, MinIO+Postgres (запись включена), подготовка браузера."""
+    def __init__(
+        self,
+        min_side: int = 300,
+        rotate_every_products: int = 20,          # каждые N товаров перезапускаем Chromium
+        close_browser_each_product: bool = False  # закрывать Chromium после каждого товара
+    ):
         print("==================================================")
         print("STORAGE SERVICE INITIALIZATION")
         print("==================================================")
@@ -121,7 +156,12 @@ class QualityImageParser:
         Settings.raise_when_ele_not_found = False
         self.page: Optional[ChromiumPage] = None
 
+        # HTTP session + pooling/retry
         self.session = requests.Session()
+        retries = Retry(total=3, backoff_factor=0.2, status_forcelist=(429, 500, 502, 503, 504))
+        adapter = HTTPAdapter(pool_connections=32, pool_maxsize=64, max_retries=retries)
+        self.session.mount('http://', adapter)
+        self.session.mount('https://', adapter)
         self.session.headers.update({
             'User-Agent': ('Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
                            'AppleWebKit/537.36 (KHTML, like Gecko) '
@@ -135,70 +175,12 @@ class QualityImageParser:
         })
 
         self.min_side = min_side
+        self.rotate_every_products = int(rotate_every_products) if rotate_every_products else 0
+        self.close_browser_each_product = bool(close_browser_each_product)
 
-        # Локальная папка для временных загрузок (удаляем файлы после загрузки в MinIO)
+        # Временная папка
         self.download_dir = os.path.join(os.getcwd(), "downloaded_images")
         os.makedirs(self.download_dir, exist_ok=True)
-
-    # -------------------- (НЕ ИСПОЛЬЗУЕТСЯ) Очистка при запуске --------------------
-
-    def clear_minio_products(self, prefix: str = 'products/'):
-        print("🗑️  Очистка MinIO (ручной вызов)...")
-        try:
-            s3 = boto3.client(
-                "s3",
-                endpoint_url=settings.S3_ENDPOINT_URL,
-                aws_access_key_id=settings.AWS_ACCESS_KEY_ID,
-                aws_secret_access_key=settings.AWS_SECRET_ACCESS_KEY,
-                region_name=settings.AWS_REGION,
-                config=Config(s3={'addressing_style': 'path'}, signature_version='s3v4'),
-            )
-            paginator = s3.get_paginator('list_objects_v2')
-            total_deleted = 0
-            for page in paginator.paginate(Bucket=settings.S3_BUCKET_NAME, Prefix=prefix):
-                if 'Contents' not in page:
-                    continue
-                objs = [{'Key': obj['Key']} for obj in page['Contents']]
-                while objs:
-                    batch = objs[:1000]
-                    s3.delete_objects(Bucket=settings.S3_BUCKET_NAME, Delete={'Objects': batch, 'Quiet': True})
-                    total_deleted += len(batch)
-                    objs = objs[1000:]
-            if total_deleted:
-                print(f"✅ MinIO: удалено объектов: {total_deleted}")
-            else:
-                print("📭 MinIO: по префиксу ничего не найдено")
-        except Exception as e:
-            print(f"❌ Ошибка очистки MinIO: {e}")
-
-    def clear_database_images(self):
-        print("🗑️  Очистка записей в БД product_images (ручной вызов)...")
-        try:
-            with SessionLocal() as db:
-                before = db.query(ProductImage).count()
-                print(f"📊 В БД записей до очистки: {before}")
-                if before == 0:
-                    print("📭 Очистка БД: уже пусто")
-                    return
-                batch_size = 1000
-                deleted_total = 0
-                while True:
-                    batch = db.query(ProductImage).limit(batch_size).all()
-                    if not batch:
-                        break
-                    for rec in batch:
-                        db.delete(rec)
-                    db.commit()
-                    deleted_total += len(batch)
-                    print(f"🗑️  Удалено батчом: {len(batch)} (итого: {deleted_total}/{before})")
-                after = db.query(ProductImage).count()
-                print(f"✅ Очистка БД завершена. Осталось записей: {after}")
-        except Exception as e:
-            print(f"❌ Ошибка очистки БД: {e}")
-
-    def clear_local_artifacts(self):
-        """Заглушка: локальные артефакты больше не используются и не создаются напрямую, кроме временных файлов."""
-        print("ℹ️ Локальные артефакты создаются временно в 'downloaded_images' и удаляются после загрузки.")
 
     # -------------------- Браузер --------------------
 
@@ -208,18 +190,18 @@ class QualityImageParser:
                 print("🌐 Инициализация DrissionPage (headless)...")
                 co = ChromiumOptions()
 
-                # 1) Пытаемся включить headless через "современный" API
+                # 1) Современный API headless
                 enabled = False
                 for m in ('set_headless', 'headless'):
                     if hasattr(co, m):
                         try:
-                            getattr(co, m)(True)  # co.set_headless(True) или co.headless(True)
+                            getattr(co, m)(True)
                             enabled = True
                             break
                         except Exception:
                             pass
 
-                # 2) Если нет — фоллбэк на передачу аргументов
+                # 2) Фолбэк флагами
                 if not enabled:
                     for flag in ('--headless=new', '--headless'):
                         try:
@@ -230,7 +212,7 @@ class QualityImageParser:
                         except Exception:
                             continue
 
-                # Доп. надёжные флаги для контейнеров/VPS
+                # Флаги стабильности
                 for arg in ('--disable-gpu', '--no-sandbox', '--disable-dev-shm-usage', '--window-size=1920,1080'):
                     try:
                         if hasattr(co, 'set_argument'):
@@ -245,8 +227,7 @@ class QualityImageParser:
                 return True
             except Exception as e:
                 print(f"❌ Ошибка инициализации DrissionPage: {e}")
-                print("ℹ️ Проверьте установку Chromium/Chrome. При необходимости задайте путь вручную, например:")
-                print("   co = ChromiumOptions(); co.set_browser_path('/usr/bin/chromium')  # затем ChromiumPage(co)")
+                print("ℹ️ Укажите путь к Chromium при необходимости: co.set_browser_path('/usr/bin/chromium')")
                 return False
         return True
 
@@ -259,211 +240,104 @@ class QualityImageParser:
             except Exception:
                 pass
 
-    def _dump_html(self, html: str, product_name: str, suffix: str):
-        """Заглушка: не сохраняем HTML на диск."""
-        return
-
-    # -------------------- Шаг 1: открыть поиск --------------------
+    # -------------------- Поиск (без модалки) --------------------
 
     def open_search_by_name(self, product_name: str) -> str:
         q = quote(product_name)
         url = f"https://yandex.ru/images/search?text={q}"
         print(f"📡 Открываем выдачу Яндекс.Картинок: {url}")
         self.page.get(url)
-        time.sleep(1.0)
+        time.sleep(0.5)
         return url
 
-    # -------------------- Шаг 2: клик по плитке -> модалка --------------------
+    def _scroll_collect_candidate_hrefs(self, need: int, max_rounds: int = 12) -> List[str]:
+        """Скроллим SERP вниз и собираем href с img_url из плиток."""
+        seen: Set[str] = set()
+        hrefs: List[str] = []
 
-    def _wait_modal_opened(self, timeout: float = 4.0) -> bool:
-        end = time.time() + timeout
-        last_url = None
-        while time.time() < end:
-            btn = self._find_open_button_element()
-            if btn:
-                return True
+        rounds = 0
+        last_count = 0
 
-            url = (self.page.url or "").lower()
-            if url != last_url:
-                last_url = url
-                if ('rpt=imageview' in url) or ('rpt=simage' in url) or ('img_url=' in url):
-                    return True
-
-            if self._modal_img_element() is not None:
-                return True
-
-            time.sleep(0.25)
-        return False
-
-    def _modal_img_element(self):
-        for sel in [
-            'css:.MMImage-Origin img',
-            'css:.MMImage img',
-            'css:.ImagePreview img',
-            'css:.ModalImage img',
-        ]:
+        while rounds < max_rounds and len(hrefs) < need:
+            rounds += 1
+            # собрать все a[href*="img_url="]
             try:
-                img = self.page.ele(sel, timeout=0.2)
-                if img and img.attr('src'):
-                    return img
+                anchors = self.page.eles('css:a[href*="img_url="]') or []
             except Exception:
-                continue
-        return None
+                anchors = []
 
-    def _best_modal_img_url(self) -> Optional[str]:
-        for sel in [
-            'css:.MMImage-Origin img',
-            'css:.MMImage img',
-            'css:.ImagePreview img',
-            'css:.ModalImage img',
-            'css:img'
-        ]:
-            try:
-                img = self.page.ele(sel, timeout=0.6)
-                if not img:
+            for a in anchors:
+                try:
+                    href = a.attr('href') or ''
+                    if not href:
+                        continue
+                    # нормализуем абсолютный
+                    if href.startswith('//'): href = 'https:' + href
+                    elif href.startswith('/'): href = urljoin('https://yandex.ru', href)
+                    if 'img_url=' not in href:
+                        continue
+                    if href in seen:
+                        continue
+                    seen.add(href)
+                    hrefs.append(href)
+                except Exception:
                     continue
-                ss = img.attr('srcset')
-                if ss:
-                    best_url = None
-                    best_w = -1
-                    for part in ss.split(','):
-                        t = part.strip().split()
-                        if not t:
-                            continue
-                        url = t[0]
-                        w = 0
-                        if len(t) > 1 and t[1].endswith('w'):
-                            try:
-                                w = int(t[1][:-1])
-                            except Exception:
-                                w = 0
-                        if url.startswith('http') and w > best_w:
-                            best_w, best_url = w, url
-                    if best_url:
-                        return best_url
-                src = img.attr('src')
-                if src and src.startswith('http'):
-                    return src
+
+            # если прироста нет — пробуем пролистать ещё
+            if len(hrefs) >= need:
+                break
+
+            if len(hrefs) == last_count:
+                # доскроллить до низа + подождать
+                try:
+                    self.page.scroll.to_bottom()
+                except Exception:
+                    pass
+                time.sleep(0.6)
+            else:
+                last_count = len(hrefs)
+                try:
+                    self.page.scroll.down(1200)
+                except Exception:
+                    pass
+                time.sleep(0.3)
+
+        return hrefs
+
+    def _extract_img_urls_from_hrefs(self, hrefs: List[str], max_items: int) -> List[str]:
+        """Достаём оригинальные картинки из параметра img_url."""
+        out: List[str] = []
+        seen_urls: Set[str] = set()
+        for href in hrefs:
+            try:
+                q = parse_qs(urlparse(href).query)
+                raw = q.get('img_url', [None])[0]
+                if not raw:
+                    continue
+                url = unquote(raw)
+                if not url.startswith('http'):
+                    continue
+                # нормализуем без query для дедупликации
+                base = url.split('?', 1)[0]
+                if base in seen_urls:
+                    continue
+                seen_urls.add(base)
+                out.append(url)
+                if len(out) >= max_items:
+                    break
             except Exception:
                 continue
-        return None
+        return out
 
-    def _find_open_button_element(self):
-        try:
-            e = self.page.ele('xpath://a[normalize-space()="Открыть"]', timeout=0.3)
-            if e: return e
-        except Exception: pass
-        try:
-            e = self.page.ele('xpath://button[normalize-space()="Открыть"]', timeout=0.3)
-            if e: return e
-        except Exception: pass
-        try:
-            e = self.page.ele('text:Открыть', timeout=0.3)
-            if e: return e
-        except Exception: pass
-        try:
-            els = self.page.eles('css:a[aria-label*="Открыть"],a[title*="Открыть"]') or []
-            if els: return els[0]
-        except Exception: pass
-        return None
-
-    def _click_open_button_and_get_href(self) -> Optional[str]:
-        btn = self._find_open_button_element()
-        if not btn:
-            print("⚠️  Не нашли «Открыть» — будем вытаскивать картинку из модалки")
-            return None
-
-        href = btn.attr('href') or ''
-        if href:
-            if href.startswith('//'): href = 'https:' + href
-            elif href.startswith('/'): href = urljoin('https://yandex.ru', href)
-
-        try:
-            try: btn.scroll.to_see()
-            except Exception: pass
-            try: btn.click()
-            except Exception: btn.click(by_js=True)
-            print("✅ Клик по «Открыть» выполнен")
-        except Exception as e:
-            print(f"⚠️  Ошибка клика по «Открыть»: {e}")
-
-        return href or None
-
-    def _open_modal_by_tile_index(self, tile_index: int) -> bool:
-        selectors = [
-            'css:a.ImagesContentImage-Cover',
-            'css:.ImagesContent-Item a[href]',
-            'css:.serp-item a[href]',
-            'css:img'
-        ]
-        for sel in selectors:
-            try:
-                tiles = self.page.eles(sel) or []
-                if tile_index >= len(tiles): continue
-                t = tiles[tile_index]
-                try: t.scroll.to_see()
-                except Exception: pass
-                try: t.click()
-                except Exception: t.click(by_js=True)
-
-                if self._wait_modal_opened(timeout=4.0):
-                    print(f"✅ Модалка открыта по плитке #{tile_index+1} ({sel})")
-                    return True
-
-                print(f"ℹ️  Модалка не распознана после клика по плитке #{tile_index+1} ({sel})")
-                try: self.page.key.press('Escape')
-                except Exception: pass
-                time.sleep(0.2)
-
-            except Exception as e:
-                print(f"⚠️  Ошибка при попытке клика по селектору {sel}: {e}")
-                continue
-        return False
-
-    # -------------------- Шаг 4: скачать В ПАМЯТЬ (оставлено для совместимости, не используется по умолчанию) --------------------
-
-    def _download_to_memory(self, url: str, referer: Optional[str]) -> Optional[BytesIO]:
-        headers = self.session.headers.copy()
-        if referer:
-            headers['Referer'] = referer
-        else:
-            origin = _origin(url)
-            if origin:
-                headers['Referer'] = origin
-
-        print(f"📥 Скачиваем в память: {url}")
-        try:
-            resp = self.session.get(url, headers=headers, timeout=25, verify=False, stream=True, allow_redirects=True)
-            resp.raise_for_status()
-        except requests.RequestException as e:
-            print(f"❌ HTTP ошибка: {e}")
-            return None
-
-        data = BytesIO(resp.content)
-        try:
-            with Image.open(data) as im:
-                im.load()
-                w, h = im.size
-                if min(w, h) < self.min_side:
-                    print(f"⚠️  Слишком маленькое: {w}x{h} (<{self.min_side})")
-                    return None
-        except Exception as e:
-            print(f"⚠️  PIL ошибка: {e}")
-            return None
-
-        data.seek(0)
-        return data
-
-    # -------------------- Шаг 4b: скачать В ФАЙЛ (основной путь) --------------------
+    # -------------------- Скачивание с валидацией --------------------
 
     def _download_to_file(self, url: str, referer: Optional[str]) -> Optional[str]:
         headers = self.session.headers.copy()
-        if referer:
-            headers['Referer'] = referer
-        else:
-            origin = _origin(url)
-            if origin:
-                headers['Referer'] = origin
+
+        # Подбор безопасного Referer
+        ref = _domain_referer(url, referer or _origin(url) or 'https://yandex.ru/images/')
+        if ref:
+            headers['Referer'] = ref
 
         try:
             os.makedirs(self.download_dir, exist_ok=True)
@@ -473,90 +347,97 @@ class QualityImageParser:
         ts = int(time.time() * 1000)
         tmp_name = f"dl_{ts}_{os.getpid()}"
 
-        # Угадываем расширение заранее
+        # HEAD быстрая проверка
         try:
-            head = self.session.head(url, headers=headers, timeout=10, verify=False, allow_redirects=True)
-            ct = head.headers.get("Content-Type", "")
+            head = self.session.head(url, headers=headers, timeout=(5, 10), verify=False, allow_redirects=True)
+            ct_head = (head.headers.get("Content-Type", "") or "").lower()
+            if ct_head and (not ct_head.startswith('image/')):
+                print(f"⚠️  HEAD не image/* ({ct_head}) — пропуск")
+                return None
         except Exception:
-            ct = ""
-        ext = _guess_ext(url, ct) or ".jpg"
-        file_path = os.path.join(self.download_dir, tmp_name + ext)
+            ct_head = ""
+
+        # GET с сигнатурой
+        try:
+            r = self.session.get(url, headers=headers, timeout=(5, 25), verify=False, stream=True, allow_redirects=True)
+            r.raise_for_status()
+        except requests.RequestException as e:
+            print(f"❌ HTTP ошибка: {e}")
+            return None
+
+        ct = (r.headers.get('Content-Type', '') or '').lower()
+        if ct and (not ct.startswith('image/')):
+            print(f"⚠️  GET не image/* ({ct}) — пропуск")
+            try: r.close()
+            except Exception: pass
+            return None
+
+        # первые байты
+        try:
+            first = next(r.iter_content(chunk_size=8192))
+        except StopIteration:
+            first = b''
+        except Exception:
+            try: r.close()
+            except Exception: pass
+            return None
+
+        magic = _magic_image_type(first[:16])
+        if not magic:
+            print("⚠️  Не похоже на изображение по сигнатуре — пропуск")
+            try: r.close()
+            except Exception: pass
+            return None
+
+        ext = _guess_ext(url, ct or ct_head) or ".jpg"
+        file_path = os.path.join(self.download_dir, f"{tmp_name}{ext}")
 
         print(f"📥 Скачиваем в файл: {url} -> {file_path}")
         try:
-            with self.session.get(url, headers=headers, timeout=25, verify=False, stream=True, allow_redirects=True) as r:
-                r.raise_for_status()
-                with open(file_path, "wb") as f:
-                    for chunk in r.iter_content(chunk_size=1024 * 128):
-                        if chunk:
-                            f.write(chunk)
-        except requests.RequestException as e:
-            print(f"❌ HTTP ошибка: {e}")
+            with open(file_path, "wb") as f:
+                if first:
+                    f.write(first)
+                for chunk in r.iter_content(chunk_size=1024 * 128):
+                    if chunk:
+                        f.write(chunk)
+        except Exception as e:
+            print(f"❌ Ошибка записи файла: {e}")
             try:
                 if os.path.exists(file_path):
                     os.remove(file_path)
             except Exception:
                 pass
             return None
+        finally:
+            try: r.close()
+            except Exception: pass
 
-        # Валидация размеров без полного декодирования (size читается из заголовка)
+        # Быстрая проверка размеров (без полного декодирования)
         try:
             with Image.open(file_path) as im:
-                w, h = im.size  # без im.load()
+                w, h = im.size
                 if min(w, h) < self.min_side:
                     print(f"⚠️  Слишком маленькое: {w}x{h} (<{self.min_side})")
                     os.remove(file_path)
                     return None
-                # Предохранитель от «гигантов»
-                if (w * h) > 40_000_000:  # > 40 МП — скип
+                if (w * h) > 40_000_000:
                     print(f"⚠️  Слишком большое изображение {w}x{h} (>40 МП) — пропуск")
                     os.remove(file_path)
                     return None
         except Exception as e:
             print(f"⚠️  PIL ошибка: {e}")
-            try:
-                os.remove(file_path)
-            except Exception:
-                pass
+            try: os.remove(file_path)
+            except Exception: pass
             return None
 
         return file_path
 
     # -------------------- MinIO + БД --------------------
 
-    def optimize_and_save_image(self, image_data: BytesIO, product_id: str, filename: str) -> Optional[str]:
-        """Оставлено для обратной совместимости; основной путь — из файла."""
-        try:
-            image_data.seek(0)
-            with Image.open(image_data) as img:
-                if img.mode in ('RGBA', 'P'):
-                    img = img.convert('RGB')
-                img.thumbnail((800, 600), Image.Resampling.LANCZOS)
-
-                output_buffer = BytesIO()
-                img.save(output_buffer, format='JPEG', quality=85, optimize=True)
-
-                storage_path = f"products/{product_id[:12]}/{filename}"
-                output_buffer.seek(0)
-                success = storage_service.save_file(
-                    storage_path,
-                    output_buffer,
-                    "image/jpeg"
-                )
-                if not success:
-                    print("❌ storage_service вернул False")
-                    return None
-                print(f"✅ Изображение сохранено в MinIO: {storage_path}")
-                return storage_path
-        except Exception as e:
-            print(f"❌ Ошибка обработки/сохранения в MinIO: {e}")
-            return None
-
     def optimize_and_save_image_from_file(self, file_path: str, product_id: str, filename: str) -> Optional[str]:
-        """Оптимизация с диска: draft() для JPEG, конверт в RGB, thumbnail -> JPEG в буфер -> MinIO."""
+        """Оптимизация с диска: draft() для JPEG, конверт в RGB, thumbnail -> JPEG -> MinIO."""
         try:
             with Image.open(file_path) as img:
-                # draft() уменьшает декодируемые данные для больших JPEG
                 try:
                     if (img.format or '').upper() == 'JPEG':
                         img.draft('RGB', (800, 600))
@@ -608,8 +489,8 @@ class QualityImageParser:
                 status="ready",
                 alt_text=alt_text or "Изображение товара",
                 sort_order=0,
-                uploaded_at=datetime.utcnow(),
-                processed_at=datetime.utcnow()
+                uploaded_at=datetime.now(timezone.utc),
+                processed_at=datetime.now(timezone.utc)
             )
 
             db.add(image_record)
@@ -623,25 +504,8 @@ class QualityImageParser:
             print(f"❌ Ошибка создания записи в БД: {e}")
             return False
 
-    def _upload_bytes_to_minio_and_record(self, image_data: BytesIO, product, seq: int) -> bool:
-        """Старый путь: из памяти. Сейчас не используется по умолчанию."""
-        filename = f"img_{seq:03d}.jpg"  # всегда JPEG
-        storage_path = self.optimize_and_save_image(image_data, str(product.id), filename)
-        if not storage_path:
-            return False
-        with SessionLocal() as db:
-            ok = self.create_image_record(
-                db=db,
-                product_id=product.id,
-                storage_path=storage_path,
-                is_primary=(seq == 1),
-                alt_text=f"Изображение товара {product.name}"
-            )
-        return ok
-
     def _upload_file_to_minio_and_record(self, file_path: str, product, seq: int) -> bool:
-        """Новый путь: из файла. ВСЕГДА удаляет локальный файл в finally."""
-        filename = f"img_{seq:03d}.jpg"  # всегда JPEG
+        filename = f"img_{seq:03d}.jpg"
         try:
             storage_path = self.optimize_and_save_image_from_file(file_path, str(product.id), filename)
             if not storage_path:
@@ -662,9 +526,9 @@ class QualityImageParser:
             except Exception:
                 pass
 
-    # -------------------- Поиск лучшей ссылки --------------------
-
+    # -------------------- Вспомогательное (оставлено для совместимости) --------------------
     def _largest_img_src_on_page(self) -> Optional[str]:
+        """Оставляю на случай, если понадобится открыть конкретную страницу (не используется в основном пути)."""
         try:
             imgs = self.page.eles('css:img') or []
         except Exception:
@@ -696,150 +560,10 @@ class QualityImageParser:
                 continue
         return best_url
 
-    # -------------------- Подсчёт уже загруженных изображений --------------------
+    # -------------------- Выбор товаров --------------------
 
-    def _existing_images_count(self, product_id: str) -> int:
-        """Оставлено для совместимости; в основной логике мы используем батч-подсчёт."""
-        try:
-            with SessionLocal() as db:
-                return db.query(ProductImage).filter(ProductImage.product_id == product_id).count()
-        except Exception as e:
-            print(f"⚠️ Не удалось получить число изображений для продукта {product_id}: {e}")
-            return 0
-
-    # -------------------- Основной цикл: докачать до 3 файлов на товар --------------------
-
-    def process_product(self, product: Product, images_per_product: int = 3, **kwargs) -> int:
-        """
-        existing_count — опциональный аргумент (передаётся из батч-запроса).
-        Если не передан, падаем обратно на _existing_images_count (медленнее).
-        """
-        print(f"\n🎯 Обрабатываем товар: '{product.name}' (ID: {product.id})")
-        print("-" * 60)
-
-        if not self.init_page():
-            print("❌ Не удалось инициализировать браузер")
-            return 0
-
-        existing = kwargs.get('existing_count')
-        if existing is None:
-            # fallback для совместимости, но основная ветка — батч
-            existing = self._existing_images_count(product.id)
-
-        if existing >= images_per_product:
-            print(f"⏭️ Уже есть {existing} изображений (≥ {images_per_product}). Пропуск товара.")
-            return 0
-
-        need_to_save = images_per_product - existing
-        print(f"ℹ️  В БД уже: {existing}. Нужно докачать: {need_to_save}.")
-
-        results_url = self.open_search_by_name(product.name)
-
-        saved = 0
-        tried = 0
-        tile_index = 0
-        downloaded_urls: Set[str] = set()
-        max_tile_attempts = need_to_save * 12
-
-        while saved < need_to_save and tried < max_tile_attempts:
-            if not (self.page.url or "").startswith("https://yandex.ru/images"):
-                self.page.get(results_url)
-                time.sleep(0.6)
-
-            opened = self._open_modal_by_tile_index(tile_index)
-            tried += 1
-            tile_index += 1
-
-            if not opened:
-                print("⚠️  Плитка не открыла модалку — следующая")
-                continue
-
-            modal_best_url = self._best_modal_img_url()
-            open_href = self._click_open_button_and_get_href()
-
-            download_url = None
-            referer_for_download = None
-
-            if open_href:
-                print(f"➡️  Переходим по «Открыть»: {open_href}")
-                self.page.get(open_href)
-                time.sleep(1.0)
-                final_url = self.page.url or ""
-
-                if _is_direct_image_url(final_url):
-                    download_url = final_url
-                    referer_for_download = _origin(final_url)
-                else:
-                    largest = self._largest_img_src_on_page()
-                    if largest:
-                        download_url = largest
-                        referer_for_download = self.page.url
-
-            if not download_url and modal_best_url:
-                download_url = modal_best_url
-                referer_for_download = _origin(modal_best_url) or 'https://yandex.ru/'
-
-            if not download_url:
-                print("❌ Не удалось получить ссылку на картинку — следующая плитка")
-                self.page.get(results_url)
-                time.sleep(0.6)
-                continue
-
-            if download_url in downloaded_urls:
-                print("ℹ️  Дубликат URL — пропуск")
-                self.page.get(results_url)
-                time.sleep(0.6)
-                continue
-
-            seq = existing + saved + 1
-            print(f"🔗 Будем скачивать (в файл): {download_url} -> seq={seq}")
-
-            file_path = self._download_to_file(download_url, referer_for_download)
-
-            self.page.get(results_url)
-            time.sleep(0.6)
-
-            if not file_path:
-                print("⚠️  Не удалось скачать в файл — следующая плитка")
-                continue
-
-            if self._upload_file_to_minio_and_record(file_path, product, seq=seq):
-                saved += 1
-                downloaded_urls.add(download_url)
-                print(f"📈 Прогресс по товару: {existing + saved}/{images_per_product}")
-            else:
-                print("⚠️  Не удалось загрузить в MinIO/записать в БД — следующая плитка")
-
-        print(f"\n✅ Сохранено изображений для товара: {saved}/{need_to_save} (итог в БД будет {existing + saved})")
-        return saved
-
-    # -------------------- Получение товаров из БД (полный список — оставлено) --------------------
-
-    def get_products_from_db(self) -> List[Product]:
-        try:
-            print("📦 Получаем товары из БД...")
-            with SessionLocal() as db:
-                from sqlalchemy.orm import lazyload
-                products = db.query(Product).options(
-                    lazyload(Product.attributes),
-                    lazyload(Product.images),
-                    lazyload(Product.category)
-                ).all()
-                print(f"📦 Получено товаров: {len(products)}")
-                return products
-        except Exception as e:
-            print(f"❌ Ошибка получения товаров: {e}")
-            return []
-
-    # -------------------- БЫСТРО: взять только товары с недостающими фото (ОДИН запрос) --------------------
-
-    def get_products_needing_images(self, images_per_product: int = 3) -> (List[Product], Dict[str, int]):
-        """
-        Возвращает:
-          - products: список Product только тех, у кого фото < images_per_product
-          - counts: dict {product_id: текущее_кол-во_фото}
-        Делается ОДИН SQL запрос с LEFT JOIN + GROUP BY + HAVING.
-        """
+    def get_products_needing_images(self, images_per_product: int = 3) -> Tuple[List[Product], Dict[str, int]]:
+        """Один батч-запрос: берем только товары, где фото < images_per_product."""
         try:
             print(f"📦 Батч-запрос: ищем товары с фото < {images_per_product} ...")
             from sqlalchemy import func
@@ -872,20 +596,126 @@ class QualityImageParser:
             print(f"❌ Ошибка батч-запроса: {e}")
             return [], {}
 
+    # -------------------- Основной цикл по товару (без модалки) --------------------
+
+    def process_product(self, product: Product, images_per_product: int = 3, **kwargs) -> int:
+        """
+        existing_count — опциональный аргумент (из батч-запроса).
+        """
+        print(f"\n🎯 Обрабатываем товар: '{product.name}' (ID: {product.id})")
+        print("-" * 60)
+
+        if not self.init_page():
+            print("❌ Не удалось инициализировать браузер")
+            return 0
+
+        existing = kwargs.get('existing_count')
+        if existing is None:
+            try:
+                with SessionLocal() as db:
+                    existing = db.query(ProductImage).filter(ProductImage.product_id == product.id).count()
+            except Exception:
+                existing = 0
+
+        if existing >= images_per_product:
+            print(f"⏭️ Уже есть {existing} изображений (≥ {images_per_product}). Пропуск товара.")
+            return 0
+
+        need_to_save = images_per_product - existing
+        print(f"ℹ️  В БД уже: {existing}. Нужно докачать: {need_to_save}.")
+
+        # 1) Открываем выдачу
+        self.open_search_by_name(product.name)
+
+        # 2) Собираем кандидатов из плиток (без открытия модалки)
+        raw_hrefs = self._scroll_collect_candidate_hrefs(need=need_to_save * 8, max_rounds=14)
+        candidates = self._extract_img_urls_from_hrefs(raw_hrefs, max_items=need_to_save * 6)
+
+        if not candidates:
+            print("⚠️  Не нашли ни одного прямого кандидата по img_url — пропуск товара")
+            return 0
+
+        # 3) Грузим по кандидатам
+        saved = 0
+        tried = 0
+        seen_hosts: Set[str] = set()
+        downloaded_urls: Set[str] = set()
+
+        for url in candidates:
+            if saved >= need_to_save:
+                break
+            tried += 1
+
+            # лёгкая диверсификация по доменам (чтобы не биться много раз о один и тот же блокирующий CDN)
+            host = (urlparse(url).netloc or '').lower()
+            if host in seen_hosts and tried < len(candidates):
+                # попробуем сначала новые домены
+                continue
+            seen_hosts.add(host)
+
+            ref = _domain_referer(url, 'https://yandex.ru/images/')
+            if url in downloaded_urls:
+                continue
+
+            seq = existing + saved + 1
+            print(f"🔗 Будем скачивать (в файл): {url} -> seq={seq}")
+            file_path = self._download_to_file(url, referer=ref)
+            if not file_path:
+                print("⚠️  Не удалось скачать/валидировать — skip")
+                continue
+
+            if self._upload_file_to_minio_and_record(file_path, product, seq=seq):
+                downloaded_urls.add(url)
+                saved += 1
+                print(f"📈 Прогресс по товару: {existing + saved}/{images_per_product}")
+                if (existing + saved) % 10 == 0:
+                    gc.collect()
+            else:
+                print("⚠️  Не удалось загрузить в MinIO/записать в БД — skip")
+
+        print(f"\n✅ Сохранено изображений для товара: {saved}/{need_to_save} (итог в БД будет {existing + saved})")
+
+        # Разгрузка тяжёлых страниц
+        try:
+            if self.page:
+                self.page.get('about:blank')
+                time.sleep(0.1)
+        except Exception:
+            pass
+
+        return saved
+
+    # -------------------- Получение всех товаров (на всякий) --------------------
+
+    def get_products_from_db(self) -> List[Product]:
+        try:
+            print("📦 Получаем товары из БД...")
+            with SessionLocal() as db:
+                from sqlalchemy.orm import lazyload
+                products = db.query(Product).options(
+                    lazyload(Product.attributes),
+                    lazyload(Product.images),
+                    lazyload(Product.category)
+                ).all()
+                print(f"📦 Получено товаров: {len(products)}")
+                return products
+        except Exception as e:
+            print(f"❌ Ошибка получения товаров: {e}")
+            return []
+
 
 # ========================= main =========================
 
 def main():
-    print("🚀 ПАРСЕР ИЗОБРАЖЕНИЙ — файл → MinIO → запись в Postgres (с авто-удалением локальных файлов)")
+    print("🚀 ПАРСЕР ИЗОБРАЖЕНИЙ — файл → MinIO → запись в Postgres (без модалки)")
     print("=" * 94)
-    print("Шаги: поиск → модалка → «Открыть» → файл → MinIO → БД (до 3 изображений на товар)\n")
+    print("Шаги: поиск → кандидаты по img_url → файл → MinIO → БД (до 3 изображений на товар)\n")
 
-    parser = QualityImageParser(min_side=300)
+    parser = QualityImageParser(min_side=300, rotate_every_products=20, close_browser_each_product=False)
 
     try:
         images_per_product = 3
 
-        # Главное ускорение: берём только тех, у кого фото меньше порога, и сразу знаем их текущий count
         products, counts = parser.get_products_needing_images(images_per_product=images_per_product)
         if not products:
             print(f"✅ Все товары уже имеют ≥ {images_per_product} изображений")
@@ -895,17 +725,28 @@ def main():
         processed = 0
 
         for product in products:
+            # Ротация Chromium каждые N товаров (опционально)
+            if parser.rotate_every_products and processed > 0 and processed % parser.rotate_every_products == 0:
+                parser.close_page()
+                time.sleep(0.2)
+
             try:
                 print(f"\n🔄 Товар {processed + 1}/{len(products)}")
                 existing = counts.get(product.id, 0)
                 saved = parser.process_product(
                     product,
                     images_per_product=images_per_product,
-                    existing_count=existing  # ← передаём готовое значение (без отдельных COUNT)
+                    existing_count=existing
                 )
                 saved_total += saved
                 processed += 1
-                time.sleep(0.4)
+                time.sleep(0.2)
+
+                # Закрывать Chromium после каждого товара (радикально снижает RAM)
+                if parser.close_browser_each_product:
+                    parser.close_page()
+                    time.sleep(0.1)
+
             except KeyboardInterrupt:
                 print("\n⏹️  Прервано пользователем")
                 break

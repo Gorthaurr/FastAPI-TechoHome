@@ -6,12 +6,13 @@
 независимо от типа хранилища.
 """
 
+import os
 import shutil
 import subprocess
 import tempfile
 from abc import ABC, abstractmethod
 from pathlib import Path
-from typing import BinaryIO, Optional
+from typing import BinaryIO, Optional, Tuple
 
 import boto3
 from botocore.config import Config
@@ -20,141 +21,92 @@ from botocore.exceptions import ClientError, NoCredentialsError
 from app.core.config import settings
 
 
+# ======================= ВСПОМОГАТЕЛЬНОЕ: безопасный запуск процессов =======================
+
+def _run_utf8(cmd: list[str], timeout: int = 30) -> Tuple[str, str, int]:
+    """
+    Безопасный запуск подпроцессов:
+    - НЕ используем text=True (чтобы не словить cp1251 на Windows);
+    - читаем байты и декодируем в UTF-8 с errors='replace';
+    - прокидываем LANG/LC_ALL=C.UTF-8.
+    """
+    env = os.environ.copy()
+    env.setdefault("LANG", "C.UTF-8")
+    env.setdefault("LC_ALL", "C.UTF-8")
+
+    try:
+        p = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=False,          # <- критично: читаем байты, не строки
+            timeout=timeout,
+            env=env,
+        )
+        out = p.stdout.decode("utf-8", errors="replace")
+        err = p.stderr.decode("utf-8", errors="replace")
+        return out, err, p.returncode
+    except subprocess.TimeoutExpired as e:
+        return "", f"TimeoutExpired: {e}", 124
+    except Exception as e:
+        return "", f"SubprocessError: {e}", 1
+
+
 class StorageProvider(ABC):
     """
     Абстрактный базовый класс для провайдеров хранилища.
-
-    Определяет интерфейс для работы с файлами в различных
-    типах хранилищ (локальное, S3, и т.д.).
     """
 
     @abstractmethod
     def save_file(
         self, file_path: str, file_data: BinaryIO, content_type: str = None
     ) -> bool:
-        """
-        Сохранить файл в хранилище.
-
-        Args:
-            file_path: Путь к файлу в хранилище
-            file_data: Данные файла
-            content_type: MIME тип файла
-
-        Returns:
-            bool: True если файл успешно сохранен
-        """
         pass
 
     @abstractmethod
     def get_file_url(self, file_path: str) -> Optional[str]:
-        """
-        Получить URL файла.
-
-        Args:
-            file_path: Путь к файлу в хранилище
-
-        Returns:
-            Optional[str]: URL файла или None если недоступен
-        """
         pass
 
     @abstractmethod
     def delete_file(self, file_path: str) -> bool:
-        """
-        Удалить файл из хранилища.
-
-        Args:
-            file_path: Путь к файлу в хранилище
-
-        Returns:
-            bool: True если файл успешно удален
-        """
         pass
 
     @abstractmethod
     def file_exists(self, file_path: str) -> bool:
-        """
-        Проверить существование файла.
-
-        Args:
-            file_path: Путь к файлу в хранилище
-
-        Returns:
-            bool: True если файл существует
-        """
         pass
 
 
 class LocalStorageProvider(StorageProvider):
     """
     Локальное хранилище файлов.
-
-    Сохраняет файлы в локальной файловой системе
-    с поддержкой CDN URL для доступа.
     """
 
     def __init__(self, base_path: str = None):
-        """
-        Инициализация локального хранилища.
-
-        Args:
-            base_path: Базовый путь для хранения файлов
-        """
         self.base_path = Path(base_path or settings.STORAGE_PATH)
         self.base_path.mkdir(parents=True, exist_ok=True)
 
     def save_file(
         self, file_path: str, file_data: BinaryIO, content_type: str = None
     ) -> bool:
-        """
-        Сохранить файл в локальное хранилище.
-
-        Args:
-            file_path: Путь к файлу в хранилище
-            file_data: Данные файла
-            content_type: MIME тип файла (не используется в локальном хранилище)
-
-        Returns:
-            bool: True если файл успешно сохранен
-        """
         try:
-            print(f"❌ LOCAL STORAGE: Saving file to {file_path}")
+            print(f"✅ LOCAL STORAGE: Saving file to {file_path}")
             full_path = self.base_path / file_path
             full_path.parent.mkdir(parents=True, exist_ok=True)
 
             with open(full_path, "wb") as f:
                 shutil.copyfileobj(file_data, f)
 
-            print(f"❌ LOCAL STORAGE: File saved to {full_path}")
+            print(f"✅ LOCAL STORAGE: File saved to {full_path}")
             return True
         except Exception as e:
-            print(f"Error saving file to local storage: {e}")
+            print(f"❌ LOCAL STORAGE: Error saving file: {e}")
             return False
 
     def get_file_url(self, file_path: str) -> Optional[str]:
-        """
-        Получить локальный URL файла.
-
-        Args:
-            file_path: Путь к файлу в хранилище
-
-        Returns:
-            Optional[str]: URL файла для доступа
-        """
         if settings.CDN_BASE_URL:
             return f"{settings.CDN_BASE_URL.rstrip('/')}/{file_path.lstrip('/')}"
         return f"/static/{file_path}"
 
     def delete_file(self, file_path: str) -> bool:
-        """
-        Удалить файл из локального хранилища.
-
-        Args:
-            file_path: Путь к файлу в хранилище
-
-        Returns:
-            bool: True если файл успешно удален
-        """
         try:
             full_path = self.base_path / file_path
             if full_path.exists():
@@ -162,59 +114,41 @@ class LocalStorageProvider(StorageProvider):
                 return True
             return False
         except Exception as e:
-            print(f"Error deleting file from local storage: {e}")
+            print(f"❌ LOCAL STORAGE: Error deleting file: {e}")
             return False
 
     def file_exists(self, file_path: str) -> bool:
-        """
-        Проверить существование файла в локальном хранилище.
-
-        Args:
-            file_path: Путь к файлу в хранилище
-
-        Returns:
-            bool: True если файл существует
-        """
         full_path = self.base_path / file_path
         return full_path.exists()
 
 
 class MinIOStorageProvider(StorageProvider):
     """
-    MinIO хранилище через mc команды.
-    
-    Использует mc (MinIO Client) для работы с MinIO,
-    обходя проблемы с boto3 API.
+    MinIO хранилище через mc команды (docker exec mc ...).
     """
 
-    def __init__(self, bucket_name: str, endpoint_url: str = None):
-        """
-        Инициализация MinIO хранилища.
-
-        Args:
-            bucket_name: Имя bucket
-            endpoint_url: URL MinIO сервера
-        """
+    def __init__(self, bucket_name: str, endpoint_url: str = None, container_name: str = "scripts-minio-1"):
         self.bucket_name = bucket_name
         self.endpoint_url = endpoint_url or settings.S3_ENDPOINT_URL or "http://localhost:9000"
         self.access_key = settings.AWS_ACCESS_KEY_ID
         self.secret_key = settings.AWS_SECRET_ACCESS_KEY
-        
-        # Настраиваем mc alias
+        self.container_name = container_name
+
+        # Настройка alias один раз
         self._setup_mc_alias()
 
     def _setup_mc_alias(self):
         """Настройка mc alias для подключения к MinIO."""
         try:
             cmd = [
-                "docker", "exec", "scripts-minio-1", "mc", "alias", "set", 
+                "docker", "exec", self.container_name, "mc", "alias", "set",
                 "local", self.endpoint_url, self.access_key, self.secret_key
             ]
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
-            if result.returncode == 0:
+            out, err, rc = _run_utf8(cmd, timeout=15)
+            if rc == 0:
                 print(f"✅ MinIO mc alias настроен: {self.endpoint_url}")
             else:
-                print(f"⚠️ MinIO mc alias setup warning: {result.stderr}")
+                print(f"⚠️ MinIO mc alias setup warning (rc={rc}): {err.strip() or out.strip()}")
         except Exception as e:
             print(f"❌ MinIO mc alias setup error: {e}")
 
@@ -222,78 +156,80 @@ class MinIOStorageProvider(StorageProvider):
         self, file_path: str, file_data: BinaryIO, content_type: str = None
     ) -> bool:
         """
-        Сохранить файл в MinIO через mc.
-
-        Args:
-            file_path: Путь к файлу в хранилище
-            file_data: Данные файла
-            content_type: MIME тип файла
-
-        Returns:
-            bool: True если файл успешно сохранен
+        Сохранить файл в MinIO через mc:
+        1) пишем во временный файл на хосте;
+        2) docker cp -> /tmp внутри контейнера;
+        3) docker exec mc cp -> local/bucket/path;
+        4) удаляем временный файл в контейнере.
         """
         try:
             print(f"✅ MinIO STORAGE: Saving file to {file_path}")
-            
-            # Создаем временный файл
+
+            # 1) Временный файл на хосте
             with tempfile.NamedTemporaryFile(delete=False) as temp_file:
                 shutil.copyfileobj(file_data, temp_file)
                 temp_file_path = temp_file.name
-            
+
+            filename_only = Path(file_path).name
+            container_tmp = f"/tmp/{filename_only}"
+
             try:
-                # Копируем файл в контейнер
+                # 2) Копируем файл в контейнер (байтовый режим; лог по завершении)
                 copy_cmd = [
-                    "docker", "cp", temp_file_path, 
-                    f"scripts-minio-1:/tmp/{Path(file_path).name}"
+                    "docker", "cp", temp_file_path,
+                    f"{self.container_name}:{container_tmp}"
                 ]
-                subprocess.run(copy_cmd, check=True, timeout=10)
-                
-                # Загружаем файл в MinIO через mc
+                out, err, rc = _run_utf8(copy_cmd, timeout=30)
+                if rc != 0:
+                    print(f"❌ MinIO STORAGE: docker cp failed (rc={rc}): {err.strip() or out.strip()}")
+                    return False
+                else:
+                    size_kb = max(1, Path(temp_file_path).stat().st_size // 1024)
+                    print(f"Successfully copied {size_kb:.1f}kB to {self.container_name}:{container_tmp}")
+
+                # 3) Загружаем файл в MinIO через mc
                 mc_cmd = [
-                    "docker", "exec", "scripts-minio-1", "mc", "cp",
-                    f"/tmp/{Path(file_path).name}",
+                    "docker", "exec", self.container_name, "mc", "cp",
+                    container_tmp,
                     f"local/{self.bucket_name}/{file_path}"
                 ]
-                result = subprocess.run(mc_cmd, capture_output=True, text=True, timeout=30)
-                
-                if result.returncode == 0:
-                    print(f"✅ MinIO STORAGE: File uploaded successfully")
+                out, err, rc = _run_utf8(mc_cmd, timeout=60)
+                if rc == 0:
+                    print("✅ MinIO STORAGE: File uploaded successfully")
                     return True
                 else:
-                    print(f"❌ MinIO STORAGE: Upload failed: {result.stderr}")
+                    print(f"❌ MinIO STORAGE: Upload failed (rc={rc}): {err.strip() or out.strip()}")
                     return False
-                    
+
             finally:
-                # Удаляем временный файл
+                # 4) Чистим временные файлы (и на хосте, и в контейнере)
                 Path(temp_file_path).unlink(missing_ok=True)
-                
+                rm_cmd = ["docker", "exec", self.container_name, "rm", "-f", container_tmp]
+                _run_utf8(rm_cmd, timeout=10)
+
         except Exception as e:
             print(f"❌ MinIO STORAGE: Error saving file: {e}")
             return False
 
     def get_file_url(self, file_path: str) -> Optional[str]:
         """
-        Получить URL файла в MinIO.
-
-        Args:
-            file_path: Путь к файлу в хранилище
-
-        Returns:
-            Optional[str]: URL файла для доступа
+        Получить presigned URL файла в MinIO через mc share download.
         """
-        # Для MinIO генерируем presigned URL через mc
         try:
             cmd = [
-                "docker", "exec", "scripts-minio-1", "mc", "share", "download",
+                "docker", "exec", self.container_name, "mc", "share", "download",
                 f"local/{self.bucket_name}/{file_path}"
             ]
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
-            
-            if result.returncode == 0:
-                # Извлекаем URL из вывода mc
-                output = result.stdout.strip()
-                if "http" in output:
-                    return output.split()[-1]  # Последнее слово должно быть URL
+            out, err, rc = _run_utf8(cmd, timeout=20)
+            if rc == 0:
+                text = (out or "").strip()
+                # Простейшая выборка URL — берём последнее "слово", содержащее http
+                parts = text.split()
+                for token in reversed(parts):
+                    if token.startswith("http://") or token.startswith("https://"):
+                        return token
+            else:
+                print(f"⚠️ MinIO STORAGE: URL generation failed (rc={rc}): {err.strip() or out.strip()}")
             return None
         except Exception as e:
             print(f"❌ MinIO STORAGE: Error generating URL: {e}")
@@ -302,25 +238,18 @@ class MinIOStorageProvider(StorageProvider):
     def delete_file(self, file_path: str) -> bool:
         """
         Удалить файл из MinIO.
-
-        Args:
-            file_path: Путь к файлу в хранилище
-
-        Returns:
-            bool: True если файл успешно удален
         """
         try:
             cmd = [
-                "docker", "exec", "scripts-minio-1", "mc", "rm",
+                "docker", "exec", self.container_name, "mc", "rm",
                 f"local/{self.bucket_name}/{file_path}"
             ]
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
-            
-            if result.returncode == 0:
-                print(f"✅ MinIO STORAGE: File deleted successfully")
+            out, err, rc = _run_utf8(cmd, timeout=20)
+            if rc == 0:
+                print("✅ MinIO STORAGE: File deleted successfully")
                 return True
             else:
-                print(f"❌ MinIO STORAGE: Delete failed: {result.stderr}")
+                print(f"❌ MinIO STORAGE: Delete failed (rc={rc}): {err.strip() or out.strip()}")
                 return False
         except Exception as e:
             print(f"❌ MinIO STORAGE: Error deleting file: {e}")
@@ -329,58 +258,34 @@ class MinIOStorageProvider(StorageProvider):
     def file_exists(self, file_path: str) -> bool:
         """
         Проверить существование файла в MinIO.
-
-        Args:
-            file_path: Путь к файлу в хранилище
-
-        Returns:
-            bool: True если файл существует
         """
         try:
             cmd = [
-                "docker", "exec", "scripts-minio-1", "mc", "ls",
+                "docker", "exec", self.container_name, "mc", "ls",
                 f"local/{self.bucket_name}/{file_path}"
             ]
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
-            return result.returncode == 0
+            out, err, rc = _run_utf8(cmd, timeout=15)
+            return rc == 0
         except Exception:
             return False
 
 
 class S3StorageProvider(StorageProvider):
     """
-    Amazon S3 хранилище.
-
-    Сохраняет файлы в Amazon S3 или совместимых сервисах
-    (MinIO, DigitalOcean Spaces и т.д.).
+    Amazon S3 хранилище (или совместимые сервисы).
     """
 
     def __init__(self, bucket_name: str, region: str = None, endpoint_url: str = None):
-        """
-        Инициализация S3 хранилища.
-
-        Args:
-            bucket_name: Имя S3 bucket
-            region: AWS регион
-            endpoint_url: Кастомный endpoint URL (для MinIO и т.д.)
-        """
         self.bucket_name = bucket_name
         self.region = region or "us-east-1"
 
-        # Конфигурация для MinIO с retry и таймаутами
         config = Config(
-            retries={
-                'max_attempts': 3,
-                'mode': 'adaptive'
-            },
+            retries={'max_attempts': 3, 'mode': 'adaptive'},
             connect_timeout=10,
             read_timeout=30,
-            s3={
-                'addressing_style': 'path'  # path-style для MinIO
-            }
+            s3={'addressing_style': 'path'}
         )
 
-        # Инициализация клиента S3 с правильными настройками для MinIO
         self.s3_client = boto3.client(
             "s3",
             region_name=self.region,
@@ -390,32 +295,20 @@ class S3StorageProvider(StorageProvider):
             config=config,
             use_ssl=False if endpoint_url and 'localhost' in endpoint_url else True
         )
-        
-        # Устанавливаем signature_version для MinIO
+        # Для MinIO
         self.s3_client._client_config.signature_version = 's3v4'
 
     def test_connection(self) -> bool:
-        """
-        Проверить подключение к S3/MinIO.
-        
-        Returns:
-            bool: True если подключение успешно
-        """
         try:
             print(f"🔍 S3 STORAGE: Testing connection to {self.s3_client.meta.endpoint_url}")
             print(f"🔍 S3 STORAGE: Using credentials: {settings.AWS_ACCESS_KEY_ID}")
-            
-            # Пытаемся получить список bucket'ов
             response = self.s3_client.list_buckets()
             print(f"✅ S3 STORAGE: Connection successful, found {len(response.get('Buckets', []))} buckets")
-            
-            # Проверяем конкретный bucket
             try:
                 self.s3_client.head_bucket(Bucket=self.bucket_name)
                 print(f"✅ S3 STORAGE: Bucket '{self.bucket_name}' exists and accessible")
             except Exception as bucket_error:
                 print(f"⚠️ S3 STORAGE: Bucket '{self.bucket_name}' check failed: {bucket_error}")
-                
             return True
         except Exception as e:
             print(f"❌ S3 STORAGE: Connection failed: {e}")
@@ -426,52 +319,34 @@ class S3StorageProvider(StorageProvider):
     def save_file(
         self, file_path: str, file_data: BinaryIO, content_type: str = None
     ) -> bool:
-        """
-        Сохранить файл в S3.
-
-        Args:
-            file_path: Путь к файлу в хранилище
-            file_data: Данные файла
-            content_type: MIME тип файла
-
-        Returns:
-            bool: True если файл успешно сохранен
-        """
         try:
             print(f"✅ S3 STORAGE: Saving file to {file_path}")
             print(f"✅ S3 STORAGE: Bucket: {self.bucket_name}, Endpoint: {self.s3_client.meta.endpoint_url}")
 
-            # Проверяем, что bucket существует
             try:
                 self.s3_client.head_bucket(Bucket=self.bucket_name)
                 print(f"✅ S3 STORAGE: Bucket {self.bucket_name} exists")
             except ClientError as e:
-                error_code = e.response['Error']['Code']
-                if error_code == '404':
+                code = e.response['Error']['Code']
+                if code == '404':
                     print(f"❌ S3 STORAGE: Bucket {self.bucket_name} not found")
                     return False
-                elif error_code == '403':
+                elif code == '403':
                     print(f"❌ S3 STORAGE: Access denied to bucket {self.bucket_name}")
                     return False
                 else:
                     print(f"⚠️ S3 STORAGE: Bucket check error: {e}")
-                    # Продолжаем попытку загрузки
 
             extra_args = {}
             if content_type:
                 extra_args["ContentType"] = content_type
 
-            print(f"✅ S3 STORAGE: Uploading file to S3...")
-            
-            # Читаем все данные файла для получения размера
+            # Читаем содержимое, чтобы указать ContentLength (важно для MinIO)
             file_data.seek(0)
             file_content = file_data.read()
             file_data.seek(0)
-            
-            # Добавляем ContentLength для MinIO
             extra_args["ContentLength"] = len(file_content)
-            
-            # Используем put_object вместо upload_fileobj для лучшей совместимости с MinIO
+
             from io import BytesIO
             self.s3_client.put_object(
                 Bucket=self.bucket_name,
@@ -479,7 +354,7 @@ class S3StorageProvider(StorageProvider):
                 Body=BytesIO(file_content),
                 **extra_args
             )
-            print(f"✅ S3 STORAGE: File uploaded successfully to S3")
+            print("✅ S3 STORAGE: File uploaded successfully to S3")
             return True
         except (ClientError, NoCredentialsError) as e:
             print(f"❌ S3 STORAGE: Error saving file to S3: {e}")
@@ -491,22 +366,12 @@ class S3StorageProvider(StorageProvider):
             return False
 
     def get_file_url(self, file_path: str) -> Optional[str]:
-        """
-        Получить URL файла в S3.
-
-        Args:
-            file_path: Путь к файлу в хранилище
-
-        Returns:
-            Optional[str]: URL файла для доступа
-        """
         try:
             print(f"Generating presigned URL for path: {file_path}")
-            # Генерируем presigned URL для доступа к файлу
             url = self.s3_client.generate_presigned_url(
                 "get_object",
                 Params={"Bucket": self.bucket_name, "Key": file_path},
-                ExpiresIn=3600,  # URL действителен 1 час
+                ExpiresIn=3600,
             )
             print(f"Generated URL: {url}")
             return url
@@ -515,34 +380,16 @@ class S3StorageProvider(StorageProvider):
             return None
 
     def delete_file(self, file_path: str) -> bool:
-        """
-        Удалить файл из S3.
-
-        Args:
-            file_path: Путь к файлу в хранилище
-
-        Returns:
-            bool: True если файл успешно удален
-        """
         try:
             print(f"Deleting file from S3: {file_path}")
             self.s3_client.delete_object(Bucket=self.bucket_name, Key=file_path)
-            print(f"File deleted successfully from S3")
+            print("File deleted successfully from S3")
             return True
         except (ClientError, NoCredentialsError) as e:
             print(f"Error deleting file from S3: {e}")
             return False
 
     def file_exists(self, file_path: str) -> bool:
-        """
-        Проверить существование файла в S3.
-
-        Args:
-            file_path: Путь к файлу в хранилище
-
-        Returns:
-            bool: True если файл существует
-        """
         try:
             self.s3_client.head_object(Bucket=self.bucket_name, Key=file_path)
             return True
@@ -550,7 +397,8 @@ class S3StorageProvider(StorageProvider):
             return False
 
 
-# Создание экземпляра хранилища в зависимости от настроек
+# ======================= Создание экземпляра провайдера =======================
+
 print("=" * 50)
 print("STORAGE SERVICE INITIALIZATION")
 print("=" * 50)
@@ -565,8 +413,8 @@ if settings.STORAGE_TYPE == "s3":
         endpoint_url=settings.S3_ENDPOINT_URL,
     )
     print("✅ MinIOStorageProvider created successfully")
-    
-    # Тестируем загрузку файла
+
+    # Тест соединения и загрузки маленького файла (для ранней диагностики)
     try:
         from io import BytesIO
         test_data = BytesIO(b"test minio connection")
