@@ -1,0 +1,15 @@
+services:
+  api:
+    image: ghcr.io/demon/technofame-api:latest
+    env_file:
+      - ../.env.docker
+    depends_on:
+      postgres:
+        condition: service_healthy
+      minio:
+        condition: service_started
+      redis:
+        condition: service_started
+    ports:
+      - "18000:8000"
+    restart: unless-stopped
