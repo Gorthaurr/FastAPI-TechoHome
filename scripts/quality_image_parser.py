@@ -25,7 +25,7 @@ import time
 import warnings
 from io import BytesIO
 from datetime import datetime
-from typing import List, Optional, Set
+from typing import List, Optional, Set, Dict
 from urllib.parse import quote, urljoin, urlparse
 
 import requests
@@ -442,7 +442,6 @@ class QualityImageParser:
         data = BytesIO(resp.content)
         try:
             with Image.open(data) as im:
-                # Для памяти — принудительное load(), но этот путь сейчас не используется
                 im.load()
                 w, h = im.size
                 if min(w, h) < self.min_side:
@@ -700,6 +699,7 @@ class QualityImageParser:
     # -------------------- Подсчёт уже загруженных изображений --------------------
 
     def _existing_images_count(self, product_id: str) -> int:
+        """Оставлено для совместимости; в основной логике мы используем батч-подсчёт."""
         try:
             with SessionLocal() as db:
                 return db.query(ProductImage).filter(ProductImage.product_id == product_id).count()
@@ -709,7 +709,11 @@ class QualityImageParser:
 
     # -------------------- Основной цикл: докачать до 3 файлов на товар --------------------
 
-    def process_product(self, product: Product, images_per_product: int = 3) -> int:
+    def process_product(self, product: Product, images_per_product: int = 3, **kwargs) -> int:
+        """
+        existing_count — опциональный аргумент (передаётся из батч-запроса).
+        Если не передан, падаем обратно на _existing_images_count (медленнее).
+        """
         print(f"\n🎯 Обрабатываем товар: '{product.name}' (ID: {product.id})")
         print("-" * 60)
 
@@ -717,7 +721,11 @@ class QualityImageParser:
             print("❌ Не удалось инициализировать браузер")
             return 0
 
-        existing = self._existing_images_count(product.id)
+        existing = kwargs.get('existing_count')
+        if existing is None:
+            # fallback для совместимости, но основная ветка — батч
+            existing = self._existing_images_count(product.id)
+
         if existing >= images_per_product:
             print(f"⏭️ Уже есть {existing} изображений (≥ {images_per_product}). Пропуск товара.")
             return 0
@@ -805,7 +813,7 @@ class QualityImageParser:
         print(f"\n✅ Сохранено изображений для товара: {saved}/{need_to_save} (итог в БД будет {existing + saved})")
         return saved
 
-    # -------------------- Получение товаров из БД --------------------
+    # -------------------- Получение товаров из БД (полный список — оставлено) --------------------
 
     def get_products_from_db(self) -> List[Product]:
         try:
@@ -823,6 +831,47 @@ class QualityImageParser:
             print(f"❌ Ошибка получения товаров: {e}")
             return []
 
+    # -------------------- БЫСТРО: взять только товары с недостающими фото (ОДИН запрос) --------------------
+
+    def get_products_needing_images(self, images_per_product: int = 3) -> (List[Product], Dict[str, int]):
+        """
+        Возвращает:
+          - products: список Product только тех, у кого фото < images_per_product
+          - counts: dict {product_id: текущее_кол-во_фото}
+        Делается ОДИН SQL запрос с LEFT JOIN + GROUP BY + HAVING.
+        """
+        try:
+            print(f"📦 Батч-запрос: ищем товары с фото < {images_per_product} ...")
+            from sqlalchemy import func
+            from sqlalchemy.orm import lazyload
+            with SessionLocal() as db:
+                q = (
+                    db.query(
+                        Product,
+                        func.count(ProductImage.id).label('img_cnt')
+                    )
+                    .outerjoin(ProductImage, ProductImage.product_id == Product.id)
+                    .group_by(Product.id)
+                    .having(func.count(ProductImage.id) < images_per_product)
+                )
+
+                rows = (
+                    q.options(
+                        lazyload(Product.attributes),
+                        lazyload(Product.images),
+                        lazyload(Product.category)
+                    )
+                    .all()
+                )
+
+                products = [row[0] for row in rows]
+                counts = {row[0].id: int(row[1]) for row in rows}
+                print(f"📦 Товаров с недостающими фото: {len(products)}")
+                return products, counts
+        except Exception as e:
+            print(f"❌ Ошибка батч-запроса: {e}")
+            return [], {}
+
 
 # ========================= main =========================
 
@@ -834,19 +883,26 @@ def main():
     parser = QualityImageParser(min_side=300)
 
     try:
-        products = parser.get_products_from_db()
+        images_per_product = 3
+
+        # Главное ускорение: берём только тех, у кого фото меньше порога, и сразу знаем их текущий count
+        products, counts = parser.get_products_needing_images(images_per_product=images_per_product)
         if not products:
-            print("❌ В БД нет товаров")
+            print(f"✅ Все товары уже имеют ≥ {images_per_product} изображений")
             return
 
-        images_per_product = 3
         saved_total = 0
         processed = 0
 
         for product in products:
             try:
                 print(f"\n🔄 Товар {processed + 1}/{len(products)}")
-                saved = parser.process_product(product, images_per_product=images_per_product)
+                existing = counts.get(product.id, 0)
+                saved = parser.process_product(
+                    product,
+                    images_per_product=images_per_product,
+                    existing_count=existing  # ← передаём готовое значение (без отдельных COUNT)
+                )
                 saved_total += saved
                 processed += 1
                 time.sleep(0.4)
