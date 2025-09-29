@@ -18,12 +18,17 @@ jobs:
       contents: read
 
     env:
-      IMAGE_NAME: ${{ toLower(format('ghcr.io/{0}/technofame-api', github.repository_owner)) }}
       TAG: latest
 
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
+
+      - name: Compute image name (lowercase)
+        id: meta
+        run: |
+          IMAGE_NAME="ghcr.io/${{ github.repository_owner }}/technofame-api"
+          echo "lower=$(echo "$IMAGE_NAME" | tr '[:upper:]' '[:lower:]')" >> "$GITHUB_OUTPUT"
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
@@ -41,7 +46,7 @@ jobs:
           context: .
           file: ./Dockerfile
           push: true
-          tags: ${{ env.IMAGE_NAME }}:${{ env.TAG }}
+          tags: ${{ steps.meta.outputs.lower }}:${{ env.TAG }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
