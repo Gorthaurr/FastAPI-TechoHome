@@ -25,7 +25,6 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      # имя образа в нижнем регистре (GHCR этого требует)
       - name: Compute image name (lowercase)
         id: meta
         shell: bash
@@ -45,15 +44,19 @@ jobs:
 
       - name: Build and push image
         uses: docker/build-push-action@v6
+        env:
+          IMG: ${{ steps.meta.outputs.lower }}
         with:
           context: .
           file: ./Dockerfile
           push: true
-          tags: ${{ steps.meta.outputs.lower }}:${{ env.TAG }}
+          no-cache: true
+          tags: |
+            ${{ env.IMG }}:${{ env.TAG }}
+            ${{ env.IMG }}:${{ github.sha }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
-      # Деплой на сервер (скрипт на сервере ДОЛЖЕН делать up -d --force-recreate)
       - name: Deploy to server
         uses: appleboy/ssh-action@v1.0.3
         with:
@@ -65,8 +68,7 @@ jobs:
             set -e
             sudo -n /opt/deploy/deploy_api.sh
 
-      # Быстрый пост-деплой чек: контейнер жив, healthz OK и один Origin в CORS
-      - name: Post-deploy health check
+      - name: Post-deploy quick checks
         uses: appleboy/ssh-action@v1.0.3
         with:
           host: ${{ secrets.SSH_HOST }}
@@ -75,16 +77,16 @@ jobs:
           port: ${{ secrets.SSH_PORT }}
           script: |
             set -e
-
-            # показать запущенные контейнеры (имя может отличаться — это ок)
-            docker ps --format '{{.Names}}\t{{.Image}}\t{{.Status}}' || true
-
+            docker ps --format 'table {{.Names}}\t{{.Image}}\t{{.Status}}'
+            # Проверим версии внутри контейнера (bcrypt/passlib)
+            docker exec -i scripts-api-1 python - <<'PY'
+import importlib.metadata as m
+def v(p):
+    try: print(p, m.version(p))
+    except Exception as e: print(p, "?", e)
+v("bcrypt"); v("passlib"); 
+PY
             # healthz
             code=$(curl -sk -o /dev/null -w "%{http_code}" https://api.technofame.store/healthz)
-            echo "healthz HTTP $code"
+            echo "healthz: $code"
             test "$code" = "200"
-
-            # CORS: должен быть ровно один заголовок allow-origin
-            echo "--- Access-Control-Allow-Origin (categories) ---"
-            curl -ski -H "Origin: https://technofame.store" https://api.technofame.store/api/v1/categories \
-              | grep -i '^access-control-allow-origin' || true
