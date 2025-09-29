@@ -77,18 +77,20 @@ except Exception as e:
 
 
 # Настройка CORS middleware
+origins = [
+    "https://technofame.store",
+    "https://www.technofame.store",
+    "http://localhost:5173",
+    "http://localhost:3000",
+    "http://localhost:4173",
+    "http://127.0.0.1:3000",
+    "http://127.0.0.1:5173",
+    "http://localhost:8000",
+]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "http://localhost:3000",    # React dev server (Create React App)
-        "http://localhost:5173",    # Vite dev server
-        "http://localhost:4173",    # Vite preview
-        "http://127.0.0.1:3000",   # Alternative localhost
-        "http://127.0.0.1:5173",   # Alternative localhost
-        "http://localhost:8000",    # Same origin для тестов
-        "https://technofame.store", # Production frontend
-        "https://www.technofame.store", # Production frontend with www
-    ],
+    allow_origins=origins,          # <— только конкретные origin'ы
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
