@@ -44,16 +44,14 @@ jobs:
 
       - name: Build and push image
         uses: docker/build-push-action@v6
-        env:
-          IMG: ${{ steps.meta.outputs.lower }}
         with:
           context: .
           file: ./Dockerfile
           push: true
           no-cache: true
           tags: |
-            ${{ env.IMG }}:${{ env.TAG }}
-            ${{ env.IMG }}:${{ github.sha }}
+            ${{ steps.meta.outputs.lower }}:${{ env.TAG }}
+            ${{ steps.meta.outputs.lower }}:${{ github.sha }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
@@ -68,7 +66,7 @@ jobs:
             set -e
             sudo -n /opt/deploy/deploy_api.sh
 
-      - name: Post-deploy quick checks
+      - name: Post-deploy health check
         uses: appleboy/ssh-action@v1.0.3
         with:
           host: ${{ secrets.SSH_HOST }}
@@ -77,16 +75,10 @@ jobs:
           port: ${{ secrets.SSH_PORT }}
           script: |
             set -e
-            docker ps --format 'table {{.Names}}\t{{.Image}}\t{{.Status}}'
-            # Проверим версии внутри контейнера (bcrypt/passlib)
-            docker exec -i scripts-api-1 python - <<'PY'
-import importlib.metadata as m
-def v(p):
-    try: print(p, m.version(p))
-    except Exception as e: print(p, "?", e)
-v("bcrypt"); v("passlib"); 
-PY
-            # healthz
+            echo "--- docker ps ---"
+            docker ps || true
+
+            echo "--- healthz ---"
             code=$(curl -sk -o /dev/null -w "%{http_code}" https://api.technofame.store/healthz)
-            echo "healthz: $code"
-            test "$code" = "200"
+            echo "healthz HTTP $code"
+            test "$code" = "200" || exit 1
