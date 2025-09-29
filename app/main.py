@@ -86,7 +86,8 @@ app.add_middleware(
         "http://127.0.0.1:3000",   # Alternative localhost
         "http://127.0.0.1:5173",   # Alternative localhost
         "http://localhost:8000",    # Same origin для тестов
-        "*"  # Временно для всех (убрать в продакшене)
+        "https://technofame.store", # Production frontend
+        "https://www.technofame.store", # Production frontend with www
     ],
     allow_credentials=True,
     allow_methods=["*"],
