@@ -10,8 +10,10 @@ boto3
 aiofiles
 python-dotenv
 pydantic[email]
-passlib[bcrypt]
+passlib[bcrypt]==1.7.4
+bcrypt<4
 python-jose[cryptography]
+PyJWT
 requests
 httpx
 beautifulsoup4
