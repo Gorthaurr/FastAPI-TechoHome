@@ -10,21 +10,22 @@ on:
       - 'Dockerfile'
       - '.github/workflows/deploy-backend.yml'
 
+permissions:
+  contents: read
+  packages: write
+
+env:
+  TAG: latest
+
 jobs:
   build-and-deploy:
     runs-on: ubuntu-latest
-
-    permissions:
-      packages: write
-      contents: read
-
-    env:
-      TAG: latest
 
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
 
+      # GHCR требует нижний регистр в пути образа
       - name: Compute image name (lowercase)
         id: meta
         shell: bash
@@ -52,6 +53,9 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
+      # На сервере должен существовать bash-скрипт /opt/deploy/deploy_api.sh
+      # (с шебангом #!/usr/bin/env bash и правами +x), который делает
+      # docker compose up -d --force-recreate api
       - name: Deploy to server
         uses: appleboy/ssh-action@v1.0.3
         with:
@@ -63,6 +67,7 @@ jobs:
             set -e
             sudo -n /opt/deploy/deploy_api.sh
 
+      # Мини-ретрай для healthz без доступа к docker socket на сервере
       - name: Post-deploy health check
         uses: appleboy/ssh-action@v1.0.3
         with:
@@ -72,29 +77,13 @@ jobs:
           port: ${{ secrets.SSH_PORT }}
           script: |
             set -e
-
-            echo "--- check API locally (bypass Caddy) ---"
-            code_local=$(curl -sk -o /dev/null -w "%{http_code}" http://127.0.0.1:18000/healthz || true)
-            echo "local healthz HTTP $code_local"
-            if [ "$code_local" != "200" ]; then
-              echo "API not healthy locally. Showing docker info..."
-              sudo -n /usr/bin/docker ps || true
-              sudo -n /usr/bin/docker logs --tail=200 scripts-api-1 || true
-              exit 1
-            fi
-
-            echo "--- check via Caddy (edge) ---"
-            code_edge=$(curl -sk -o /dev/null -w "%{http_code}" https://api.technofame.store/healthz || true)
-            echo "edge healthz HTTP $code_edge"
-            if [ "$code_edge" != "200" ]; then
-              echo "Caddy returns $code_edge, showing caddy status/logs:"
-              sudo -n systemctl status caddy --no-pager || true
-              sudo -n journalctl -u caddy -n 120 --no-pager || true
-              exit 1
-            fi
-
-            echo "--- CORS sanity (one allow-origin) ---"
-            curl -ski -H "Origin: https://technofame.store" https://api.technofame.store/api/v1/categories \
-              | grep -i '^access-control-allow-origin' || true
-
-            echo "OK"
+            for i in {1..12}; do
+              code=$(curl -sk -o /dev/null -w "%{http_code}" https://api.technofame.store/healthz || true)
+              echo "Attempt $i: /healthz -> HTTP $code"
+              if [ "$code" = "200" ]; then
+                exit 0
+              fi
+              sleep 5
+            done
+            echo "Health check failed"
+            exit 1
