@@ -13,6 +13,7 @@ on:
 jobs:
   build-and-deploy:
     runs-on: ubuntu-latest
+
     permissions:
       packages: write
       contents: read
@@ -24,8 +25,10 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
+      # имя образа в нижнем регистре (GHCR этого требует)
       - name: Compute image name (lowercase)
         id: meta
+        shell: bash
         run: |
           IMAGE_NAME="ghcr.io/${{ github.repository_owner }}/technofame-api"
           echo "lower=$(echo "$IMAGE_NAME" | tr '[:upper:]' '[:lower:]')" >> "$GITHUB_OUTPUT"
@@ -50,6 +53,7 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
+      # Деплой на сервер (скрипт на сервере ДОЛЖЕН делать up -d --force-recreate)
       - name: Deploy to server
         uses: appleboy/ssh-action@v1.0.3
         with:
@@ -58,4 +62,29 @@ jobs:
           key: ${{ secrets.SSH_KEY }}
           port: ${{ secrets.SSH_PORT }}
           script: |
-            sudo /opt/deploy/deploy_api.sh
+            set -e
+            sudo -n /opt/deploy/deploy_api.sh
+
+      # Быстрый пост-деплой чек: контейнер жив, healthz OK и один Origin в CORS
+      - name: Post-deploy health check
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.SSH_HOST }}
+          username: ${{ secrets.SSH_USER }}
+          key: ${{ secrets.SSH_KEY }}
+          port: ${{ secrets.SSH_PORT }}
+          script: |
+            set -e
+
+            # показать запущенные контейнеры (имя может отличаться — это ок)
+            docker ps --format '{{.Names}}\t{{.Image}}\t{{.Status}}' || true
+
+            # healthz
+            code=$(curl -sk -o /dev/null -w "%{http_code}" https://api.technofame.store/healthz)
+            echo "healthz HTTP $code"
+            test "$code" = "200"
+
+            # CORS: должен быть ровно один заголовок allow-origin
+            echo "--- Access-Control-Allow-Origin (categories) ---"
+            curl -ski -H "Origin: https://technofame.store" https://api.technofame.store/api/v1/categories \
+              | grep -i '^access-control-allow-origin' || true
