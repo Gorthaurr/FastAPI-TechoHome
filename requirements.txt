@@ -1,17 +1,24 @@
-fastapi
-uvicorn
-sqlalchemy
-psycopg2-binary
-pydantic
+# crypto / auth
+passlib[bcrypt]==1.7.4
+bcrypt==3.2.2
+
+# web
+fastapi==0.115.0
+uvicorn[standard]==0.30.6
+
+# DB
+SQLAlchemy==2.0.36
+psycopg2-binary==2.9.9
+
+# другое — по проекту
+python-multipart==0.0.9
+pydantic==2.9.2
 pydantic-settings
 pillow
-python-multipart
 boto3
 aiofiles
 python-dotenv
 pydantic[email]
-passlib[bcrypt]==1.7.4
-bcrypt<4
 python-jose[cryptography]
 PyJWT
 requests
