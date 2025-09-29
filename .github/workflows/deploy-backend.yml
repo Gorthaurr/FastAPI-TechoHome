@@ -48,10 +48,7 @@ jobs:
           context: .
           file: ./Dockerfile
           push: true
-          no-cache: true
-          tags: |
-            ${{ steps.meta.outputs.lower }}:${{ env.TAG }}
-            ${{ steps.meta.outputs.lower }}:${{ github.sha }}
+          tags: ${{ steps.meta.outputs.lower }}:${{ env.TAG }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
@@ -75,10 +72,29 @@ jobs:
           port: ${{ secrets.SSH_PORT }}
           script: |
             set -e
-            echo "--- docker ps ---"
-            docker ps || true
 
-            echo "--- healthz ---"
-            code=$(curl -sk -o /dev/null -w "%{http_code}" https://api.technofame.store/healthz)
-            echo "healthz HTTP $code"
-            test "$code" = "200" || exit 1
+            echo "--- check API locally (bypass Caddy) ---"
+            code_local=$(curl -sk -o /dev/null -w "%{http_code}" http://127.0.0.1:18000/healthz || true)
+            echo "local healthz HTTP $code_local"
+            if [ "$code_local" != "200" ]; then
+              echo "API not healthy locally. Showing docker info..."
+              sudo -n /usr/bin/docker ps || true
+              sudo -n /usr/bin/docker logs --tail=200 scripts-api-1 || true
+              exit 1
+            fi
+
+            echo "--- check via Caddy (edge) ---"
+            code_edge=$(curl -sk -o /dev/null -w "%{http_code}" https://api.technofame.store/healthz || true)
+            echo "edge healthz HTTP $code_edge"
+            if [ "$code_edge" != "200" ]; then
+              echo "Caddy returns $code_edge, showing caddy status/logs:"
+              sudo -n systemctl status caddy --no-pager || true
+              sudo -n journalctl -u caddy -n 120 --no-pager || true
+              exit 1
+            fi
+
+            echo "--- CORS sanity (one allow-origin) ---"
+            curl -ski -H "Origin: https://technofame.store" https://api.technofame.store/api/v1/categories \
+              | grep -i '^access-control-allow-origin' || true
+
+            echo "OK"
