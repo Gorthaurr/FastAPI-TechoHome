@@ -15,6 +15,7 @@ from sqlalchemy.orm import Session, selectinload
 
 from app.db.database import get_db
 from app.db.models import Order, OrderItem, Product
+from app.schemas.order import OrderCreate
 
 router = APIRouter()
 
@@ -121,7 +122,7 @@ def list_orders(
 
 
 @router.post("", response_model=dict, status_code=201)
-def create_order(payload: dict, db: Session = Depends(get_db)):
+def create_order(order_data: OrderCreate, db: Session = Depends(get_db)):
     """
     Создать новый заказ.
 
@@ -154,22 +155,20 @@ def create_order(payload: dict, db: Session = Depends(get_db)):
     Raises:
         HTTPException: При некорректных данных или отсутствующих товарах
     """
-    if not isinstance(payload, dict):
+    if not isinstance(order_data, OrderCreate):
         raise HTTPException(400, detail="Invalid request body")
 
-    customer = payload.get("customer") or {}
-    items = payload.get("items") or []
+    customer = order_data.customer
+    items = order_data.items
     if not items:
         raise HTTPException(400, detail="Order must contain at least one item")
 
-    currency = payload.get("currency") or "EUR"
-    shipping_cents = int(payload.get("shipping_cents") or 0)
-    comment = payload.get("comment")
+    currency = order_data.currency
+    shipping_cents = order_data.shipping_cents
+    comment = order_data.comment
 
     # Проверка товаров и создание снимка цен/названий
-    product_ids = [
-        str(item.get("product_id")) for item in items if item.get("product_id")
-    ]
+    product_ids = [str(item.product_id) for item in items if item.product_id]
     rows = db.scalars(select(Product).where(Product.id.in_(product_ids))).all()
     product_map = {p.id: p for p in rows}
     missing = [pid for pid in product_ids if pid not in product_map]
@@ -182,12 +181,12 @@ def create_order(payload: dict, db: Session = Depends(get_db)):
         id=order_id,
         status="pending",
         currency=currency,
-        customer_name=str(customer.get("name") or ""),
-        customer_email=customer.get("email"),
-        customer_phone=customer.get("phone"),
-        shipping_address=customer.get("address"),
-        shipping_city=customer.get("city"),
-        shipping_postal_code=customer.get("postal_code"),
+        customer_name=str(customer.name or ""),
+        customer_email=customer.email,
+        customer_phone=customer.phone,
+        shipping_address=customer.address,
+        shipping_city=customer.city,
+        shipping_postal_code=customer.postal_code,
         shipping_cents=shipping_cents,
         comment=comment,
     )
@@ -197,8 +196,8 @@ def create_order(payload: dict, db: Session = Depends(get_db)):
     # Создание позиций заказа
     subtotal = 0
     for item in items:
-        product_id = str(item.get("product_id"))
-        qty = int(item.get("qty") or 0)
+        product_id = str(item.product_id)
+        qty = item.qty
         if qty <= 0:
             raise HTTPException(
                 400, detail=f"Quantity must be > 0 for product {product_id}"
