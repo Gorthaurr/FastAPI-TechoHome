@@ -327,7 +327,10 @@ class S3StorageProvider(StorageProvider):
         self, file_path: str, file_data: BinaryIO, content_type: str = None
     ) -> bool:
         try:
-            print(f"✅ S3 STORAGE: Saving file to {file_path}")
+            # Убираем префикс 'products/' если он есть (для совместимости с БД)
+            clean_path = file_path.replace("products/", "", 1) if file_path.startswith("products/") else file_path
+            
+            print(f"✅ S3 STORAGE: Saving file to {file_path} (storage path: {clean_path})")
             print(f"✅ S3 STORAGE: Bucket: {self.bucket_name}, Endpoint: {self.s3_client.meta.endpoint_url}")
 
             try:
@@ -357,11 +360,11 @@ class S3StorageProvider(StorageProvider):
             from io import BytesIO
             self.s3_client.put_object(
                 Bucket=self.bucket_name,
-                Key=file_path,
+                Key=clean_path,  # Используем clean_path без префикса
                 Body=BytesIO(file_content),
                 **extra_args
             )
-            print("✅ S3 STORAGE: File uploaded successfully to S3")
+            print(f"✅ S3 STORAGE: File uploaded successfully to {clean_path}")
             return True
         except (ClientError, NoCredentialsError) as e:
             print(f"❌ S3 STORAGE: Error saving file to S3: {e}")
@@ -374,31 +377,38 @@ class S3StorageProvider(StorageProvider):
 
     def get_file_url(self, file_path: str) -> Optional[str]:
         try:
-            print(f"Generating presigned URL for path: {file_path}")
-            url = self.s3_client.generate_presigned_url(
-                "get_object",
-                Params={"Bucket": self.bucket_name, "Key": file_path},
-                ExpiresIn=3600,
-            )
-            print(f"Generated URL: {url}")
+            # Убираем префикс 'products/' если он есть (для совместимости с БД)
+            clean_path = file_path.replace("products/", "", 1) if file_path.startswith("products/") else file_path
+            
+            # Для публичного bucket формируем прямой URL без presigned
+            public_endpoint = "https://s3.technofame.store"
+            url = f"{public_endpoint}/{self.bucket_name}/{clean_path}"
+            
+            print(f"✅ S3 STORAGE: Generated URL for {file_path} -> {url}")
             return url
-        except (ClientError, NoCredentialsError) as e:
-            print(f"Error generating S3 URL: {e}")
+        except Exception as e:
+            print(f"❌ S3 STORAGE: Error generating URL: {e}")
             return None
 
     def delete_file(self, file_path: str) -> bool:
         try:
-            print(f"Deleting file from S3: {file_path}")
-            self.s3_client.delete_object(Bucket=self.bucket_name, Key=file_path)
-            print("File deleted successfully from S3")
+            # Убираем префикс 'products/' если он есть (для совместимости с БД)
+            clean_path = file_path.replace("products/", "", 1) if file_path.startswith("products/") else file_path
+            
+            print(f"Deleting file from S3: {clean_path}")
+            self.s3_client.delete_object(Bucket=self.bucket_name, Key=clean_path)
+            print(f"✅ S3 STORAGE: File deleted successfully: {clean_path}")
             return True
         except (ClientError, NoCredentialsError) as e:
-            print(f"Error deleting file from S3: {e}")
+            print(f"❌ S3 STORAGE: Error deleting file: {e}")
             return False
 
     def file_exists(self, file_path: str) -> bool:
         try:
-            self.s3_client.head_object(Bucket=self.bucket_name, Key=file_path)
+            # Убираем префикс 'products/' если он есть (для совместимости с БД)
+            clean_path = file_path.replace("products/", "", 1) if file_path.startswith("products/") else file_path
+            
+            self.s3_client.head_object(Bucket=self.bucket_name, Key=clean_path)
             return True
         except ClientError:
             return False
@@ -414,22 +424,20 @@ print(f"S3_BUCKET_NAME: {settings.S3_BUCKET_NAME}")
 print(f"S3_ENDPOINT_URL: {settings.S3_ENDPOINT_URL}")
 
 if settings.STORAGE_TYPE == "s3":
-    print("Creating MinIOStorageProvider (using mc commands)...")
-    storage_service = MinIOStorageProvider(
+    print("Creating S3StorageProvider (boto3 for MinIO, works from Docker)...")
+    storage_service = S3StorageProvider(
         bucket_name=settings.S3_BUCKET_NAME,
         endpoint_url=settings.S3_ENDPOINT_URL,
+        region=settings.AWS_REGION,
     )
-    print("✅ MinIOStorageProvider created successfully")
+    print("✅ S3StorageProvider created successfully")
 
-    # Тест соединения и загрузки маленького файла (для ранней диагностики)
+    # Тест соединения через boto3
     try:
-        from io import BytesIO
-        test_data = BytesIO(b"test minio connection")
-        if storage_service.save_file("test_connection.txt", test_data):
-            print("✅ MinIO connection test passed")
-            storage_service.delete_file("test_connection.txt")
+        if storage_service.test_connection():
+            print("✅ MinIO connection via boto3 successful")
         else:
-            print("❌ MinIO connection test failed")
+            print("❌ MinIO connection via boto3 failed")
     except Exception as e:
         print(f"❌ MinIO connection test error: {e}")
 else:
