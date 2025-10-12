@@ -1102,14 +1102,14 @@ async def admin_upload_image(
     if not product:
         raise HTTPException(404, detail="Product not found")
 
-    # Валидируем файл
-    is_valid, error_message = image_service.validate_file(file.filename, file.size)
-    if not is_valid:
-        raise HTTPException(400, detail=error_message)
-
     try:
-        # Читаем содержимое файла
+        # Читаем содержимое файла сначала, чтобы узнать размер
         content = await file.read()
+        
+        # Валидируем файл (используем реальный размер из content)
+        is_valid, error_message = image_service.validate_file(file.filename, len(content))
+        if not is_valid:
+            raise HTTPException(400, detail=error_message)
         
         # Используем storage_service для сохранения файла
         from io import BytesIO
@@ -1136,7 +1136,7 @@ async def admin_upload_image(
         image.sort_order = sort_order
         image.is_primary = is_primary
         image.status = "ready"
-        image.file_size = file.size
+        image.file_size = len(content)  # Используем реальный размер
         image.alt_text = alt_text or f"Изображение для {product.name}"
         print(f"Creating DB record: product_id={product_id}, path={relative_path}, filename={file.filename}")
 
