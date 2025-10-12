@@ -14,26 +14,51 @@ permissions:
   contents: read
   packages: write
 
+# Общие переменные окружения (подстрой под свой порт/URL/пути)
 env:
-  TAG: latest
+  REGISTRY: ghcr.io
+  IMAGE_NAME: technofame-api
+  SERVICE_NAME: api
+  COMPOSE_FILE: /opt/deploy/docker-compose.yml
+  # внутренний health на сервере — проверь, что порт совпадает с тем, на котором слушает бэкенд!
+  LOCAL_HEALTH_URL: http://127.0.0.1:8000/healthz
+  # внешний health через публичный прокси/HTTPS — замени на свой домен
+  PUBLIC_HEALTH_URL: https://api.technofame.store/healthz
 
 jobs:
   build-and-deploy:
     runs-on: ubuntu-latest
+    concurrency:
+      group: backend-${{ github.ref }}
+      cancel-in-progress: true
 
     steps:
-      - name: Checkout code
+      - name: Checkout
         uses: actions/checkout@v4
 
-      # GHCR требует нижний регистр в пути образа
-      - name: Compute image name (lowercase)
+      # Приводим owner к нижнему регистру и собираем каноническое имя образа
+      - name: Compute image ref (lowercase)
         id: meta
-        shell: bash
         run: |
-          IMAGE_NAME="ghcr.io/${{ github.repository_owner }}/technofame-api"
-          echo "lower=$(echo "$IMAGE_NAME" | tr '[:upper:]' '[:lower:]')" >> "$GITHUB_OUTPUT"
+          OWNER_LC=$(echo "${{ github.repository_owner }}" | tr '[:upper:]' '[:lower:]')
+          echo "owner_lc=$OWNER_LC" >> "$GITHUB_OUTPUT"
+          echo "image=${{ env.REGISTRY }}/${OWNER_LC}/${{ env.IMAGE_NAME }}" >> "$GITHUB_OUTPUT"
 
-      - name: Set up Docker Buildx
+      - name: Docker metadata (tags + labels)
+        id: dmeta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ steps.meta.outputs.image }}
+          tags: |
+            type=raw,value=latest
+            type=sha
+            type=ref,event=tag
+          labels: |
+            org.opencontainers.image.title=${{ env.IMAGE_NAME }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.source=${{ github.repository }}
+
+      - name: Set up Buildx
         uses: docker/setup-buildx-action@v3
 
       - name: Login to GHCR
@@ -43,20 +68,28 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Build and push image
+      - name: Build & Push image
+        id: build
         uses: docker/build-push-action@v6
         with:
           context: .
           file: ./Dockerfile
           push: true
-          tags: ${{ steps.meta.outputs.lower }}:${{ env.TAG }}
+          tags: ${{ steps.dmeta.outputs.tags }}
+          labels: ${{ steps.dmeta.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+          # публикуем по digest, чтобы можно было подтягивать точную сборку
+          outputs: type=image,name=${{ steps.meta.outputs.image }},push-by-digest=true,name-canonical=true
 
-      # На сервере должен существовать bash-скрипт /opt/deploy/deploy_api.sh
-      # (с шебангом #!/usr/bin/env bash и правами +x), который делает
-      # docker compose up -d --force-recreate api
-      - name: Deploy to server
+      - name: Show image digest
+        run: |
+          echo "Image: ${{ steps.meta.outputs.image }}"
+          echo "Digest: ${{ steps.build.outputs.digest }}"
+
+      # === ДЕПЛОЙ НА СЕРВЕР ===
+      # На сервере должны быть: docker, docker compose plugin, доступ к GHCR (если образ приватный — заранее login)
+      - name: Deploy on server (pull by digest + recreate)
         uses: appleboy/ssh-action@v1.0.3
         with:
           host: ${{ secrets.SSH_HOST }}
@@ -64,11 +97,30 @@ jobs:
           key: ${{ secrets.SSH_KEY }}
           port: ${{ secrets.SSH_PORT }}
           script: |
-            set -e
-            sudo -n /opt/deploy/deploy_api.sh
+            set -euo pipefail
 
-      # Мини-ретрай для healthz без доступа к docker socket на сервере
-      - name: Post-deploy health check
+            IMAGE="${{ steps.meta.outputs.image }}@${{ steps.build.outputs.digest }}"
+            COMPOSE="${{ env.COMPOSE_FILE }}"
+            SERVICE="${{ env.SERVICE_NAME }}"
+
+            echo "[deploy] Pulling image ${IMAGE}"
+            # Если образ приватный — предварительно выполните docker login ghcr.io на сервере с PAT (read:packages)
+            docker pull "${IMAGE}"
+
+            echo "[deploy] Updating compose service ${SERVICE}"
+            # Вариант A: образ уже захардкожен в compose (с тегом/sha). Тогда обычный pull+up:
+            docker compose -f "${COMPOSE}" pull "${SERVICE}" || true
+            # Вариант B: хотите гарантированно пересобрать с новым digest — используйте 'set image':
+            docker compose -f "${COMPOSE}" up -d --force-recreate "${SERVICE}"
+
+            echo "[deploy] ps status:"
+            docker compose -f "${COMPOSE}" ps
+
+            echo "[deploy] last logs (tail 120):"
+            docker compose -f "${COMPOSE}" logs --no-color -n 120 "${SERVICE}" || true
+
+      # ЛОКАЛЬНЫЙ HEALTH CHECK НА СЕРВЕРЕ (минуем внешний прокси)
+      - name: Container health check (on server, localhost)
         uses: appleboy/ssh-action@v1.0.3
         with:
           host: ${{ secrets.SSH_HOST }}
@@ -76,14 +128,31 @@ jobs:
           key: ${{ secrets.SSH_KEY }}
           port: ${{ secrets.SSH_PORT }}
           script: |
-            set -e
-            for i in {1..12}; do
-              code=$(curl -sk -o /dev/null -w "%{http_code}" https://api.technofame.store/healthz || true)
-              echo "Attempt $i: /healthz -> HTTP $code"
+            set -euo pipefail
+            url="${{ env.LOCAL_HEALTH_URL }}"
+            for i in {1..24}; do
+              code=$(curl -s -o /dev/null -w "%{http_code}" "$url" || true)
+              echo "Attempt $i: $url -> HTTP $code"
               if [ "$code" = "200" ]; then
                 exit 0
               fi
               sleep 5
             done
-            echo "Health check failed"
+            echo "Local container health check failed"
             exit 1
+
+      # ПУБЛИЧНЫЙ HEALTH CHECK ЧЕРЕЗ HTTPS/ПРОКСИ
+      - name: Public HTTPS health check
+        run: |
+          set -euo pipefail
+          url="${{ env.PUBLIC_HEALTH_URL }}"
+          for i in {1..24}; do
+            code=$(curl -sk -o /null -w "%{http_code}" "$url" 2>/dev/null || true)
+            echo "Attempt $i: $url -> HTTP $code"
+            if [ "$code" = "200" ]; then
+              exit 0
+            fi
+            sleep 5
+          done
+          echo "Public health check failed"
+          exit 1
