@@ -8,7 +8,7 @@ API endpoints для работы с товарами.
 from typing import Any, Dict, List, Literal, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query
-from sqlalchemy import and_, asc, desc, func, select
+from sqlalchemy import and_, asc, case, desc, func, select
 from sqlalchemy.orm import Session, selectinload
 
 from app.db.database import get_db
@@ -85,32 +85,40 @@ def list_products(
     total = db.scalar(count_stmt) or 0
 
     # Основной запрос - ОПТИМИЗИРОВАННЫЙ с JOIN для изображений (только главное)
-    if include_images:
-        from app.db.models import ProductImage
-        stmt = select(Product).outerjoin(
-            ProductImage, 
-            and_(
-                Product.id == ProductImage.product_id,
-                ProductImage.is_primary == True
-            )
+    from app.db.models import ProductImage
+    
+    # Всегда делаем JOIN с изображениями для сортировки по их наличию
+    stmt = select(Product).outerjoin(
+        ProductImage, 
+        and_(
+            Product.id == ProductImage.product_id,
+            ProductImage.is_primary == True
         )
-    else:
-        stmt = select(Product)
+    )
     
     if where_clause is not None:
         stmt = stmt.where(where_clause)
 
-    # Сортировка
+    # Сортировка: сначала по наличию изображений, потом по выбранному полю
+    # Создаем CASE для сортировки: товары с изображениями (1) перед товарами без (0)
+    has_images_order = case(
+        (ProductImage.id.isnot(None), 0),  # Товары С изображениями идут первыми (0 меньше 1)
+        else_=1  # Товары БЕЗ изображений идут вторыми
+    )
+    
+    # Основная сортировка по выбранному полю
     if sort in ("name", "-name"):
-        order = asc(Product.name) if sort == "name" else desc(Product.name)
+        main_order = asc(Product.name) if sort == "name" else desc(Product.name)
     else:
         price_col = Product.price_cents
-        order = (
+        main_order = (
             asc(price_col).nulls_last()
             if sort == "price"
             else desc(price_col).nulls_last()
         )
-    stmt = stmt.order_by(order)
+    
+    # Применяем сортировку: сначала по наличию изображений, потом по основному полю
+    stmt = stmt.order_by(has_images_order, main_order)
 
     # Пагинация - с жестким лимитом для предотвращения медленных запросов
     page_size = min(page_size, 20)  # Максимум 20 товаров на страницу
