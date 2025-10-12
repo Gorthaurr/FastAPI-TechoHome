@@ -213,24 +213,22 @@ class MinIOStorageProvider(StorageProvider):
 
     def get_file_url(self, file_path: str) -> Optional[str]:
         """
-        Получить presigned URL файла в MinIO через mc share download.
+        Получить публичный URL файла в MinIO.
+        
+        Формирует прямой публичный URL вместо presigned URL,
+        так как bucket настроен как публичный.
         """
         try:
-            cmd = [
-                "docker", "exec", self.container_name, "mc", "share", "download",
-                f"local/{self.bucket_name}/{file_path}"
-            ]
-            out, err, rc = _run_utf8(cmd, timeout=20)
-            if rc == 0:
-                text = (out or "").strip()
-                # Простейшая выборка URL — берём последнее "слово", содержащее http
-                parts = text.split()
-                for token in reversed(parts):
-                    if token.startswith("http://") or token.startswith("https://"):
-                        return token
-            else:
-                print(f"⚠️ MinIO STORAGE: URL generation failed (rc={rc}): {err.strip() or out.strip()}")
-            return None
+            # Убираем префикс 'products/' если он есть (для совместимости с БД)
+            clean_path = file_path.replace("products/", "", 1) if file_path.startswith("products/") else file_path
+            
+            # Формируем прямой публичный URL
+            # Используем внешний публичный endpoint
+            public_endpoint = "https://s3.technofame.store"
+            url = f"{public_endpoint}/{self.bucket_name}/{clean_path}"
+            
+            print(f"✅ MinIO STORAGE: Generated URL for {file_path} -> {url}")
+            return url
         except Exception as e:
             print(f"❌ MinIO STORAGE: Error generating URL: {e}")
             return None
