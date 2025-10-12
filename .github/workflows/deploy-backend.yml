@@ -64,7 +64,7 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      # ВАЖНО: никаких outputs: push-by-digest=true здесь не используем, чтобы не конфликтовать с tags
+      # Пушим ПО ТЕГАМ (без push-by-digest), но digest забираем из outputs
       - name: Build & Push image (by tags)
         id: build
         uses: docker/build-push-action@v6
@@ -76,15 +76,14 @@ jobs:
           labels: ${{ steps.dmeta.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
-          # при необходимости укажите платформу; по умолчанию текущая:
-          # platforms: linux/amd64
 
       - name: Show image digest
         run: |
           echo "Image:  ${{ steps.meta.outputs.image }}"
           echo "Digest: ${{ steps.build.outputs.digest }}"
 
-      # === DEPLOY ===
+      # ================== DEPLOY ==================
+      # Авто-детект sudo и docker compose на сервере, деплой по digest
       - name: Deploy on server (pull image@digest + recreate)
         uses: appleboy/ssh-action@v1.0.3
         with:
@@ -96,24 +95,50 @@ jobs:
             set -euo pipefail
 
             IMAGE="${{ steps.meta.outputs.image }}@${{ steps.build.outputs.digest }}"
-            COMPOSE="${{ env.COMPOSE_FILE }}"
+            COMPOSE_FILE="${{ env.COMPOSE_FILE }}"
             SERVICE="${{ env.SERVICE_NAME }}"
 
-            echo "[deploy] docker pull ${IMAGE}"
-            # Если образ приватный — заранее выполнен docker login ghcr.io (PAT c read:packages)
-            docker pull "${IMAGE}"
+            # ---- SUDO DETECT ----
+            SUDO=""
+            if docker info >/dev/null 2>&1; then
+              SUDO=""
+            elif sudo -n docker info >/dev/null 2>&1; then
+              SUDO="sudo -n "
+            else
+              echo "ERROR: No permission to access Docker daemon. Options:"
+              echo "  1) Add user to 'docker' group: sudo usermod -aG docker $USER && newgrp docker"
+              echo "  2) Allow passwordless sudo for docker: visudo (NOPASSWD)"
+              exit 1
+            fi
 
-            echo "[deploy] update service ${SERVICE}"
-            # Вариант A: образ зашит в compose -> обычный pull/up:
-            docker compose -f "${COMPOSE}" pull "${SERVICE}" || true
-            docker compose -f "${COMPOSE}" up -d --force-recreate "${SERVICE}"
+            # ---- COMPOSE DETECT ----
+            if ${SUDO}docker compose version >/dev/null 2>&1; then
+              COMPOSE="${SUDO}docker compose"
+            elif ${SUDO}docker-compose version >/dev/null 2>&1; then
+              COMPOSE="${SUDO}docker-compose"
+            else
+              echo "ERROR: docker compose not found"
+              exit 1
+            fi
+
+            echo "[deploy] Pull image by digest: ${IMAGE}"
+            ${SUDO}docker pull "${IMAGE}"
+
+            # Если образ приватный и на сервере нет логина в GHCR:
+            # ${SUDO}docker login ghcr.io -u "${{ secrets.GHCR_USER }}" -p "${{ secrets.GHCR_PAT }}"
+
+            echo "[deploy] Update service: ${SERVICE}"
+            # Вариант A: образ прописан в compose (по тегу). Тогда обычный pull/up:
+            ${COMPOSE} -f "${COMPOSE_FILE}" pull "${SERVICE}" || true
+            ${COMPOSE} -f "${COMPOSE_FILE}" up -d --force-recreate "${SERVICE}"
 
             echo "[deploy] ps:"
-            docker compose -f "${COMPOSE}" ps
+            ${COMPOSE} -f "${COMPOSE_FILE}" ps
 
             echo "[deploy] last logs (tail 120):"
-            docker compose -f "${COMPOSE}" logs --no-color -n 120 "${SERVICE}" || true
+            ${COMPOSE} -f "${COMPOSE_FILE}" logs --no-color -n 120 "${SERVICE}" || true
 
+      # ЛОКАЛЬНЫЙ health-check (минует внешний прокси)
       - name: Container health check (server localhost)
         uses: appleboy/ssh-action@v1.0.3
         with:
@@ -123,6 +148,8 @@ jobs:
           port: ${{ secrets.SSH_PORT }}
           script: |
             set -euo pipefail
+
+            # SUDO DETECT для curl через 127.0.0.1 не нужен, но оставим для единообразия
             url="${{ env.LOCAL_HEALTH_URL }}"
             for i in {1..24}; do
               code=$(curl -s -o /dev/null -w "%{http_code}" "$url" || true)
@@ -135,6 +162,7 @@ jobs:
             echo "Local container health check failed"
             exit 1
 
+      # ПУБЛИЧНЫЙ health-check через HTTPS/прокси
       - name: Public HTTPS health check
         run: |
           set -euo pipefail
@@ -146,6 +174,6 @@ jobs:
               exit 0
             fi
             sleep 5
-          end
+          done
           echo "Public health check failed"
           exit 1
