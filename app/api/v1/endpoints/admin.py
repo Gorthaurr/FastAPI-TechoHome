@@ -1123,10 +1123,16 @@ async def admin_upload_image(
         print(f"Saving image to path: {relative_path}")
 
         # Сохраняем файл через storage_service
+        print(f"Storage service type: {type(storage_service).__name__}")
         success = storage_service.save_file(relative_path, file_data, file.content_type)
         print(f"Save result: {success}")
         if not success:
-            raise HTTPException(500, detail="Failed to save file to storage")
+            # Даём больше контекста об ошибке
+            storage_type = type(storage_service).__name__
+            error_detail = f"Storage ({storage_type}) failed to save file. "
+            if storage_type == "MinIOStorageProvider":
+                error_detail += "Check if MinIO Docker container is running and accessible."
+            raise HTTPException(500, detail=error_detail)
         
         # Создаем запись в БД
         image = ProductImage()
