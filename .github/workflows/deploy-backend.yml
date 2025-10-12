@@ -18,8 +18,8 @@ env:
   REGISTRY: ghcr.io
   IMAGE_NAME: technofame-api
   SERVICE_NAME: api
-  # Используем актуальный override-файл
-  COMPOSE_FILE: /opt/apps/backend/scripts/docker-compose.override.yml
+  # ВАЖНО: два файла compose в правильном порядке (базовый -> override)
+  COMPOSE_FILES: /opt/apps/backend/scripts/docker-compose.yml:/opt/apps/backend/scripts/docker-compose.override.yml
   PUBLIC_HEALTH_URL: https://api.technofame.store/healthz
 
 jobs:
@@ -81,7 +81,7 @@ jobs:
           echo "Image:  ${{ steps.meta.outputs.image }}"
           echo "Digest: ${{ steps.build.outputs.digest }}"
 
-      # ================== DEPLOY ==================
+      # ===== DEPLOY =====
       - name: Deploy on server (pull image@digest + recreate)
         uses: appleboy/ssh-action@v1.0.3
         with:
@@ -94,13 +94,17 @@ jobs:
 
             IMAGE="${{ steps.meta.outputs.image }}@${{ steps.build.outputs.digest }}"
             SERVICE="${{ env.SERVICE_NAME }}"
-            FILE="${{ env.COMPOSE_FILE }}"
+            COMPOSE_FILES_RAW="${{ env.COMPOSE_FILES }}"
 
-            echo "[deploy] compose file: ${FILE}"
-            if [ ! -f "${FILE}" ]; then
-              echo "ERROR: compose file not found: ${FILE}"
-              exit 2
-            fi
+            # Разворачиваем "a:b" в "-f a -f b"
+            IFS=':' read -r -a CF_ARR <<< "$COMPOSE_FILES_RAW"
+            COMPOSE_ARGS=""
+            echo "[deploy] Compose files in use:"
+            for f in "${CF_ARR[@]}"; do
+              echo "  - $f"
+              [ -f "$f" ] || { echo "ERROR: compose file not found: $f"; exit 2; }
+              COMPOSE_ARGS="$COMPOSE_ARGS -f $f"
+            done
 
             # ---- SUDO DETECT ----
             SUDO=""
@@ -126,20 +130,20 @@ jobs:
             echo "[deploy] docker pull ${IMAGE}"
             ${SUDO}docker pull "${IMAGE}"
 
-            # Override только image на точный digest (без сложных here-doc)
+            # Временный override — фиксируем точный digest на релиз
             TMP_OVERRIDE="$(mktemp)"
             printf "services:\n  %s:\n    image: %s\n" "${SERVICE}" "${IMAGE}" > "${TMP_OVERRIDE}"
 
             set -x
-            ${COMPOSE} -f "${FILE}" -f "${TMP_OVERRIDE}" up -d --force-recreate "${SERVICE}"
+            ${COMPOSE} ${COMPOSE_ARGS} -f "${TMP_OVERRIDE}" up -d --force-recreate "${SERVICE}"
             set +x
             rm -f "${TMP_OVERRIDE}"
 
             echo "[deploy] ps:"
-            ${COMPOSE} -f "${FILE}" ps || true
+            ${COMPOSE} ${COMPOSE_ARGS} ps || true
 
             echo "[deploy] last logs (tail 120):"
-            ${COMPOSE} -f "${FILE}" logs --no-color -n 120 "${SERVICE}" || true
+            ${COMPOSE} ${COMPOSE_ARGS} logs --no-color -n 120 "${SERVICE}" || true
 
       - name: Container health check (server localhost via mapped port)
         uses: appleboy/ssh-action@v1.0.3
@@ -148,14 +152,19 @@ jobs:
           username: ${{ secrets.SSH_USER }}
           key: ${{ secrets.SSH_KEY }}
           port: ${{ secrets.SSH_PORT }}
+        # Определяем проброшенный наружу порт контейнера (контейнерный порт 8000 — поменяй здесь, если другой)
           script: |
             set -euo pipefail
 
             SERVICE="${{ env.SERVICE_NAME }}"
-            FILE="${{ env.COMPOSE_FILE }}"
             TARGET_CONTAINER_PORT=8000
+            COMPOSE_FILES_RAW="${{ env.COMPOSE_FILES }}"
+            IFS=':' read -r -a CF_ARR <<< "$COMPOSE_FILES_RAW"
+            COMPOSE_ARGS=""
+            for f in "${CF_ARR[@]}"; do
+              COMPOSE_ARGS="$COMPOSE_ARGS -f $f"
+            done
 
-            # SUDO + COMPOSE detect
             SUDO=""
             if docker info >/dev/null 2>&1; then
               SUDO=""
@@ -174,7 +183,7 @@ jobs:
               exit 1
             fi
 
-            HOST_PORT="$(${COMPOSE} -f "${FILE}" port "${SERVICE}" ${TARGET_CONTAINER_PORT} 2>/dev/null | tail -n1 | awk -F: '{print $NF}')"
+            HOST_PORT="$(${COMPOSE} ${COMPOSE_ARGS} port "${SERVICE}" ${TARGET_CONTAINER_PORT} 2>/dev/null | tail -n1 | awk -F: '{print $NF}')"
             if [ -z "${HOST_PORT:-}" ]; then
               echo "WARN: can't detect mapped port for ${SERVICE}/${TARGET_CONTAINER_PORT}, fallback to 127.0.0.1:${TARGET_CONTAINER_PORT}"
               HOST_PORT="${TARGET_CONTAINER_PORT}"
