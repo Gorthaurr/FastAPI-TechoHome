@@ -14,15 +14,12 @@ permissions:
   contents: read
   packages: write
 
-# Общие переменные окружения (подстрой под свой порт/URL/пути)
 env:
   REGISTRY: ghcr.io
   IMAGE_NAME: technofame-api
   SERVICE_NAME: api
   COMPOSE_FILE: /opt/deploy/docker-compose.yml
-  # внутренний health на сервере — проверь, что порт совпадает с тем, на котором слушает бэкенд!
   LOCAL_HEALTH_URL: http://127.0.0.1:8000/healthz
-  # внешний health через публичный прокси/HTTPS — замени на свой домен
   PUBLIC_HEALTH_URL: https://api.technofame.store/healthz
 
 jobs:
@@ -36,8 +33,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      # Приводим owner к нижнему регистру и собираем каноническое имя образа
-      - name: Compute image ref (lowercase)
+      - name: Compute image ref (lowercase owner)
         id: meta
         run: |
           OWNER_LC=$(echo "${{ github.repository_owner }}" | tr '[:upper:]' '[:lower:]')
@@ -68,7 +64,8 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Build & Push image
+      # ВАЖНО: никаких outputs: push-by-digest=true здесь не используем, чтобы не конфликтовать с tags
+      - name: Build & Push image (by tags)
         id: build
         uses: docker/build-push-action@v6
         with:
@@ -79,17 +76,16 @@ jobs:
           labels: ${{ steps.dmeta.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
-          # публикуем по digest, чтобы можно было подтягивать точную сборку
-          outputs: type=image,name=${{ steps.meta.outputs.image }},push-by-digest=true,name-canonical=true
+          # при необходимости укажите платформу; по умолчанию текущая:
+          # platforms: linux/amd64
 
       - name: Show image digest
         run: |
-          echo "Image: ${{ steps.meta.outputs.image }}"
+          echo "Image:  ${{ steps.meta.outputs.image }}"
           echo "Digest: ${{ steps.build.outputs.digest }}"
 
-      # === ДЕПЛОЙ НА СЕРВЕР ===
-      # На сервере должны быть: docker, docker compose plugin, доступ к GHCR (если образ приватный — заранее login)
-      - name: Deploy on server (pull by digest + recreate)
+      # === DEPLOY ===
+      - name: Deploy on server (pull image@digest + recreate)
         uses: appleboy/ssh-action@v1.0.3
         with:
           host: ${{ secrets.SSH_HOST }}
@@ -103,24 +99,22 @@ jobs:
             COMPOSE="${{ env.COMPOSE_FILE }}"
             SERVICE="${{ env.SERVICE_NAME }}"
 
-            echo "[deploy] Pulling image ${IMAGE}"
-            # Если образ приватный — предварительно выполните docker login ghcr.io на сервере с PAT (read:packages)
+            echo "[deploy] docker pull ${IMAGE}"
+            # Если образ приватный — заранее выполнен docker login ghcr.io (PAT c read:packages)
             docker pull "${IMAGE}"
 
-            echo "[deploy] Updating compose service ${SERVICE}"
-            # Вариант A: образ уже захардкожен в compose (с тегом/sha). Тогда обычный pull+up:
+            echo "[deploy] update service ${SERVICE}"
+            # Вариант A: образ зашит в compose -> обычный pull/up:
             docker compose -f "${COMPOSE}" pull "${SERVICE}" || true
-            # Вариант B: хотите гарантированно пересобрать с новым digest — используйте 'set image':
             docker compose -f "${COMPOSE}" up -d --force-recreate "${SERVICE}"
 
-            echo "[deploy] ps status:"
+            echo "[deploy] ps:"
             docker compose -f "${COMPOSE}" ps
 
             echo "[deploy] last logs (tail 120):"
             docker compose -f "${COMPOSE}" logs --no-color -n 120 "${SERVICE}" || true
 
-      # ЛОКАЛЬНЫЙ HEALTH CHECK НА СЕРВЕРЕ (минуем внешний прокси)
-      - name: Container health check (on server, localhost)
+      - name: Container health check (server localhost)
         uses: appleboy/ssh-action@v1.0.3
         with:
           host: ${{ secrets.SSH_HOST }}
@@ -141,18 +135,17 @@ jobs:
             echo "Local container health check failed"
             exit 1
 
-      # ПУБЛИЧНЫЙ HEALTH CHECK ЧЕРЕЗ HTTPS/ПРОКСИ
       - name: Public HTTPS health check
         run: |
           set -euo pipefail
           url="${{ env.PUBLIC_HEALTH_URL }}"
           for i in {1..24}; do
-            code=$(curl -sk -o /null -w "%{http_code}" "$url" 2>/dev/null || true)
+            code=$(curl -sk -o /dev/null -w "%{http_code}" "$url" || true)
             echo "Attempt $i: $url -> HTTP $code"
             if [ "$code" = "200" ]; then
               exit 0
             fi
             sleep 5
-          done
+          end
           echo "Public health check failed"
           exit 1
