@@ -18,8 +18,11 @@ env:
   REGISTRY: ghcr.io
   IMAGE_NAME: technofame-api
   SERVICE_NAME: api
-  COMPOSE_FILE: /opt/deploy/docker-compose.yml
-  LOCAL_HEALTH_URL: http://127.0.0.1:8000/healthz
+
+  # ВАЖНО: используем только override как актуальный compose-файл
+  COMPOSE_FILES: /opt/apps/backend/scripts/docker-compose.override.yml
+
+  # Для публичной проверки через реверс-прокси/HTTPS
   PUBLIC_HEALTH_URL: https://api.technofame.store/healthz
 
 jobs:
@@ -64,7 +67,7 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      # Пушим ПО ТЕГАМ (без push-by-digest), но digest забираем из outputs
+      # Пушим по тегам, но деплоим по digest (без push-by-digest, чтобы не конфликтовать с tags)
       - name: Build & Push image (by tags)
         id: build
         uses: docker/build-push-action@v6
@@ -76,6 +79,7 @@ jobs:
           labels: ${{ steps.dmeta.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+          # platforms: linux/amd64
 
       - name: Show image digest
         run: |
@@ -83,7 +87,6 @@ jobs:
           echo "Digest: ${{ steps.build.outputs.digest }}"
 
       # ================== DEPLOY ==================
-      # Авто-детект sudo и docker compose на сервере, деплой по digest
       - name: Deploy on server (pull image@digest + recreate)
         uses: appleboy/ssh-action@v1.0.3
         with:
@@ -95,8 +98,18 @@ jobs:
             set -euo pipefail
 
             IMAGE="${{ steps.meta.outputs.image }}@${{ steps.build.outputs.digest }}"
-            COMPOSE_FILE="${{ env.COMPOSE_FILE }}"
             SERVICE="${{ env.SERVICE_NAME }}"
+            COMPOSE_FILES_RAW="${{ env.COMPOSE_FILES }}"
+
+            # Разворачиваем COMPOSE_FILES="a:b:c" в args "-f a -f b -f c"
+            IFS=':' read -r -a CF_ARR <<< "$COMPOSE_FILES_RAW"
+            COMPOSE_ARGS=""
+            echo "[deploy] Compose files in use:"
+            for f in "${CF_ARR[@]}"; do
+              echo "  - $f"
+              [ -f "$f" ] || { echo "ERROR: compose file not found: $f"; exit 2; }
+              COMPOSE_ARGS="$COMPOSE_ARGS -f $f"
+            done
 
             # ---- SUDO DETECT ----
             SUDO=""
@@ -105,9 +118,7 @@ jobs:
             elif sudo -n docker info >/dev/null 2>&1; then
               SUDO="sudo -n "
             else
-              echo "ERROR: No permission to access Docker daemon. Options:"
-              echo "  1) Add user to 'docker' group: sudo usermod -aG docker $USER && newgrp docker"
-              echo "  2) Allow passwordless sudo for docker: visudo (NOPASSWD)"
+              echo "ERROR: No permission to access Docker daemon. Add user to 'docker' group or allow passwordless sudo."
               exit 1
             fi
 
@@ -124,22 +135,28 @@ jobs:
             echo "[deploy] Pull image by digest: ${IMAGE}"
             ${SUDO}docker pull "${IMAGE}"
 
-            # Если образ приватный и на сервере нет логина в GHCR:
-            # ${SUDO}docker login ghcr.io -u "${{ secrets.GHCR_USER }}" -p "${{ secrets.GHCR_PAT }}"
+            # Временный override для фиксации exact digest на этот релиз
+            TMP_OVERRIDE="$(mktemp)"
+            cat > "${TMP_OVERRIDE}" <<EOF
+services:
+  ${SERVICE}:
+    image: ${IMAGE}
+EOF
 
-            echo "[deploy] Update service: ${SERVICE}"
-            # Вариант A: образ прописан в compose (по тегу). Тогда обычный pull/up:
-            ${COMPOSE} -f "${COMPOSE_FILE}" pull "${SERVICE}" || true
-            ${COMPOSE} -f "${COMPOSE_FILE}" up -d --force-recreate "${SERVICE}"
+            echo "[deploy] Using override file: ${TMP_OVERRIDE}"
+            set -x
+            ${COMPOSE} ${COMPOSE_ARGS} -f "${TMP_OVERRIDE}" up -d --force-recreate "${SERVICE}"
+            set +x
+            rm -f "${TMP_OVERRIDE}"
 
             echo "[deploy] ps:"
-            ${COMPOSE} -f "${COMPOSE_FILE}" ps
+            ${COMPOSE} ${COMPOSE_ARGS} ps || true
 
             echo "[deploy] last logs (tail 120):"
-            ${COMPOSE} -f "${COMPOSE_FILE}" logs --no-color -n 120 "${SERVICE}" || true
+            ${COMPOSE} ${COMPOSE_ARGS} logs --no-color -n 120 "${SERVICE}" || true
 
-      # ЛОКАЛЬНЫЙ health-check (минует внешний прокси)
-      - name: Container health check (server localhost)
+      # ЛОКАЛЬНЫЙ health-check: узнаём проброшенный порт (по умолчанию 8000 в контейнере; поменяй при необходимости)
+      - name: Container health check (server localhost via mapped port)
         uses: appleboy/ssh-action@v1.0.3
         with:
           host: ${{ secrets.SSH_HOST }}
@@ -149,11 +166,45 @@ jobs:
           script: |
             set -euo pipefail
 
-            # SUDO DETECT для curl через 127.0.0.1 не нужен, но оставим для единообразия
-            url="${{ env.LOCAL_HEALTH_URL }}"
+            SERVICE="${{ env.SERVICE_NAME }}"
+            TARGET_CONTAINER_PORT=8000
+
+            COMPOSE_FILES_RAW="${{ env.COMPOSE_FILES }}"
+            IFS=':' read -r -a CF_ARR <<< "$COMPOSE_FILES_RAW"
+            COMPOSE_ARGS=""
+            for f in "${CF_ARR[@]}"; do
+              COMPOSE_ARGS="$COMPOSE_ARGS -f $f"
+            done
+
+            SUDO=""
+            if docker info >/dev/null 2>&1; then
+              SUDO=""
+            elif sudo -n docker info >/dev/null 2>&1; then
+              SUDO="sudo -n "
+            else
+              echo "ERROR: No permission to access Docker daemon."
+              exit 1
+            fi
+            if ${SUDO}docker compose version >/dev/null 2>&1; then
+              COMPOSE="${SUDO}docker compose"
+            elif ${SUDO}docker-compose version >/dev/null 2>&1; then
+              COMPOSE="${SUDO}docker-compose"
+            else
+              echo "ERROR: docker compose not found"
+              exit 1
+            fi
+
+            HOST_PORT="$(${COMPOSE} ${COMPOSE_ARGS} port "${SERVICE}" ${TARGET_CONTAINER_PORT} 2>/dev/null | tail -n1 | awk -F: '{print $NF}')"
+            if [ -z "${HOST_PORT:-}" ]; then
+              echo "WARN: can't detect mapped port for ${SERVICE}/${TARGET_CONTAINER_PORT}, fallback to 127.0.0.1:${TARGET_CONTAINER_PORT}"
+              HOST_PORT="${TARGET_CONTAINER_PORT}"
+            fi
+            URL="http://127.0.0.1:${HOST_PORT}/healthz"
+            echo "[health] probing ${URL}"
+
             for i in {1..24}; do
-              code=$(curl -s -o /dev/null -w "%{http_code}" "$url" || true)
-              echo "Attempt $i: $url -> HTTP $code"
+              code=$(curl -s -o /dev/null -w "%{http_code}" "$URL" || true)
+              echo "Attempt $i: $URL -> HTTP $code"
               if [ "$code" = "200" ]; then
                 exit 0
               fi
@@ -162,7 +213,7 @@ jobs:
             echo "Local container health check failed"
             exit 1
 
-      # ПУБЛИЧНЫЙ health-check через HTTPS/прокси
+      # ПУБЛИЧНЫЙ health-check через реверс-прокси/HTTPS
       - name: Public HTTPS health check
         run: |
           set -euo pipefail
