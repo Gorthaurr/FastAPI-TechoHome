@@ -4,11 +4,11 @@ on:
   push:
     branches: [ main ]
     paths:
-      - 'app/**'
-      - 'scripts/**'
-      - 'requirements.txt'
-      - 'Dockerfile'
-      - '.github/workflows/deploy-backend.yml'
+      - "app/**"
+      - "scripts/**"
+      - "requirements.txt"
+      - "Dockerfile"
+      - ".github/workflows/deploy-backend.yml"
 
 permissions:
   contents: read
@@ -18,11 +18,8 @@ env:
   REGISTRY: ghcr.io
   IMAGE_NAME: technofame-api
   SERVICE_NAME: api
-
-  # ВАЖНО: используем только override как актуальный compose-файл
-  COMPOSE_FILES: /opt/apps/backend/scripts/docker-compose.override.yml
-
-  # Для публичной проверки через реверс-прокси/HTTPS
+  # Используем актуальный override-файл
+  COMPOSE_FILE: /opt/apps/backend/scripts/docker-compose.override.yml
   PUBLIC_HEALTH_URL: https://api.technofame.store/healthz
 
 jobs:
@@ -67,7 +64,6 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      # Пушим по тегам, но деплоим по digest (без push-by-digest, чтобы не конфликтовать с tags)
       - name: Build & Push image (by tags)
         id: build
         uses: docker/build-push-action@v6
@@ -79,7 +75,6 @@ jobs:
           labels: ${{ steps.dmeta.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
-          # platforms: linux/amd64
 
       - name: Show image digest
         run: |
@@ -99,17 +94,13 @@ jobs:
 
             IMAGE="${{ steps.meta.outputs.image }}@${{ steps.build.outputs.digest }}"
             SERVICE="${{ env.SERVICE_NAME }}"
-            COMPOSE_FILES_RAW="${{ env.COMPOSE_FILES }}"
+            FILE="${{ env.COMPOSE_FILE }}"
 
-            # Разворачиваем COMPOSE_FILES="a:b:c" в args "-f a -f b -f c"
-            IFS=':' read -r -a CF_ARR <<< "$COMPOSE_FILES_RAW"
-            COMPOSE_ARGS=""
-            echo "[deploy] Compose files in use:"
-            for f in "${CF_ARR[@]}"; do
-              echo "  - $f"
-              [ -f "$f" ] || { echo "ERROR: compose file not found: $f"; exit 2; }
-              COMPOSE_ARGS="$COMPOSE_ARGS -f $f"
-            done
+            echo "[deploy] compose file: ${FILE}"
+            if [ ! -f "${FILE}" ]; then
+              echo "ERROR: compose file not found: ${FILE}"
+              exit 2
+            fi
 
             # ---- SUDO DETECT ----
             SUDO=""
@@ -118,7 +109,7 @@ jobs:
             elif sudo -n docker info >/dev/null 2>&1; then
               SUDO="sudo -n "
             else
-              echo "ERROR: No permission to access Docker daemon. Add user to 'docker' group or allow passwordless sudo."
+              echo "ERROR: No permission to access Docker daemon."
               exit 1
             fi
 
@@ -132,30 +123,24 @@ jobs:
               exit 1
             fi
 
-            echo "[deploy] Pull image by digest: ${IMAGE}"
+            echo "[deploy] docker pull ${IMAGE}"
             ${SUDO}docker pull "${IMAGE}"
 
-            # Временный override для фиксации exact digest на этот релиз
+            # Override только image на точный digest (без сложных here-doc)
             TMP_OVERRIDE="$(mktemp)"
-            cat > "${TMP_OVERRIDE}" <<EOF
-services:
-  ${SERVICE}:
-    image: ${IMAGE}
-EOF
+            printf "services:\n  %s:\n    image: %s\n" "${SERVICE}" "${IMAGE}" > "${TMP_OVERRIDE}"
 
-            echo "[deploy] Using override file: ${TMP_OVERRIDE}"
             set -x
-            ${COMPOSE} ${COMPOSE_ARGS} -f "${TMP_OVERRIDE}" up -d --force-recreate "${SERVICE}"
+            ${COMPOSE} -f "${FILE}" -f "${TMP_OVERRIDE}" up -d --force-recreate "${SERVICE}"
             set +x
             rm -f "${TMP_OVERRIDE}"
 
             echo "[deploy] ps:"
-            ${COMPOSE} ${COMPOSE_ARGS} ps || true
+            ${COMPOSE} -f "${FILE}" ps || true
 
             echo "[deploy] last logs (tail 120):"
-            ${COMPOSE} ${COMPOSE_ARGS} logs --no-color -n 120 "${SERVICE}" || true
+            ${COMPOSE} -f "${FILE}" logs --no-color -n 120 "${SERVICE}" || true
 
-      # ЛОКАЛЬНЫЙ health-check: узнаём проброшенный порт (по умолчанию 8000 в контейнере; поменяй при необходимости)
       - name: Container health check (server localhost via mapped port)
         uses: appleboy/ssh-action@v1.0.3
         with:
@@ -167,15 +152,10 @@ EOF
             set -euo pipefail
 
             SERVICE="${{ env.SERVICE_NAME }}"
+            FILE="${{ env.COMPOSE_FILE }}"
             TARGET_CONTAINER_PORT=8000
 
-            COMPOSE_FILES_RAW="${{ env.COMPOSE_FILES }}"
-            IFS=':' read -r -a CF_ARR <<< "$COMPOSE_FILES_RAW"
-            COMPOSE_ARGS=""
-            for f in "${CF_ARR[@]}"; do
-              COMPOSE_ARGS="$COMPOSE_ARGS -f $f"
-            done
-
+            # SUDO + COMPOSE detect
             SUDO=""
             if docker info >/dev/null 2>&1; then
               SUDO=""
@@ -194,11 +174,12 @@ EOF
               exit 1
             fi
 
-            HOST_PORT="$(${COMPOSE} ${COMPOSE_ARGS} port "${SERVICE}" ${TARGET_CONTAINER_PORT} 2>/dev/null | tail -n1 | awk -F: '{print $NF}')"
+            HOST_PORT="$(${COMPOSE} -f "${FILE}" port "${SERVICE}" ${TARGET_CONTAINER_PORT} 2>/dev/null | tail -n1 | awk -F: '{print $NF}')"
             if [ -z "${HOST_PORT:-}" ]; then
               echo "WARN: can't detect mapped port for ${SERVICE}/${TARGET_CONTAINER_PORT}, fallback to 127.0.0.1:${TARGET_CONTAINER_PORT}"
               HOST_PORT="${TARGET_CONTAINER_PORT}"
             fi
+
             URL="http://127.0.0.1:${HOST_PORT}/healthz"
             echo "[health] probing ${URL}"
 
@@ -213,7 +194,6 @@ EOF
             echo "Local container health check failed"
             exit 1
 
-      # ПУБЛИЧНЫЙ health-check через реверс-прокси/HTTPS
       - name: Public HTTPS health check
         run: |
           set -euo pipefail
