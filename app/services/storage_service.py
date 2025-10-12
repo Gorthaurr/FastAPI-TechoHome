@@ -163,14 +163,17 @@ class MinIOStorageProvider(StorageProvider):
         4) удаляем временный файл в контейнере.
         """
         try:
-            print(f"✅ MinIO STORAGE: Saving file to {file_path}")
+            # Убираем префикс 'products/' если он есть (для совместимости с БД)
+            clean_path = file_path.replace("products/", "", 1) if file_path.startswith("products/") else file_path
+            
+            print(f"✅ MinIO STORAGE: Saving file to {file_path} (storage path: {clean_path})")
 
             # 1) Временный файл на хосте
             with tempfile.NamedTemporaryFile(delete=False) as temp_file:
                 shutil.copyfileobj(file_data, temp_file)
                 temp_file_path = temp_file.name
 
-            filename_only = Path(file_path).name
+            filename_only = Path(clean_path).name
             container_tmp = f"/tmp/{filename_only}"
 
             try:
@@ -187,15 +190,15 @@ class MinIOStorageProvider(StorageProvider):
                     size_kb = max(1, Path(temp_file_path).stat().st_size // 1024)
                     print(f"Successfully copied {size_kb:.1f}kB to {self.container_name}:{container_tmp}")
 
-                # 3) Загружаем файл в MinIO через mc
+                # 3) Загружаем файл в MinIO через mc (используем clean_path без префикса)
                 mc_cmd = [
                     "docker", "exec", self.container_name, "mc", "cp",
                     container_tmp,
-                    f"local/{self.bucket_name}/{file_path}"
+                    f"local/{self.bucket_name}/{clean_path}"
                 ]
                 out, err, rc = _run_utf8(mc_cmd, timeout=60)
                 if rc == 0:
-                    print("✅ MinIO STORAGE: File uploaded successfully")
+                    print(f"✅ MinIO STORAGE: File uploaded successfully to {clean_path}")
                     return True
                 else:
                     print(f"❌ MinIO STORAGE: Upload failed (rc={rc}): {err.strip() or out.strip()}")
@@ -238,13 +241,16 @@ class MinIOStorageProvider(StorageProvider):
         Удалить файл из MinIO.
         """
         try:
+            # Убираем префикс 'products/' если он есть (для совместимости с БД)
+            clean_path = file_path.replace("products/", "", 1) if file_path.startswith("products/") else file_path
+            
             cmd = [
                 "docker", "exec", self.container_name, "mc", "rm",
-                f"local/{self.bucket_name}/{file_path}"
+                f"local/{self.bucket_name}/{clean_path}"
             ]
             out, err, rc = _run_utf8(cmd, timeout=20)
             if rc == 0:
-                print("✅ MinIO STORAGE: File deleted successfully")
+                print(f"✅ MinIO STORAGE: File deleted successfully: {clean_path}")
                 return True
             else:
                 print(f"❌ MinIO STORAGE: Delete failed (rc={rc}): {err.strip() or out.strip()}")
@@ -258,9 +264,12 @@ class MinIOStorageProvider(StorageProvider):
         Проверить существование файла в MinIO.
         """
         try:
+            # Убираем префикс 'products/' если он есть (для совместимости с БД)
+            clean_path = file_path.replace("products/", "", 1) if file_path.startswith("products/") else file_path
+            
             cmd = [
                 "docker", "exec", self.container_name, "mc", "ls",
-                f"local/{self.bucket_name}/{file_path}"
+                f"local/{self.bucket_name}/{clean_path}"
             ]
             out, err, rc = _run_utf8(cmd, timeout=15)
             return rc == 0

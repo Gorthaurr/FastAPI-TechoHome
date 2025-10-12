@@ -1118,8 +1118,8 @@ async def admin_upload_image(
         file_data = BytesIO(content)
         file_data.seek(0)
         
-        # Генерируем путь для файла
-        relative_path = f"products/{product_id[:8]}/{product_id}/{file.filename}"
+        # Генерируем путь для файла (используем первые 12 символов product_id, как в парсере)
+        relative_path = f"products/{product_id[:12]}/{file.filename}"
         print(f"Saving image to path: {relative_path}")
 
         # Сохраняем файл через storage_service
