@@ -28,6 +28,7 @@ def list_products(
     page: int = Query(1, ge=1, description="Номер страницы"),
     page_size: int = Query(20, ge=1, le=100, description="Размер страницы"),
     category_id: Optional[int] = Query(None, description="Фильтр по категории"),
+    brand: Optional[str] = Query(None, description="Фильтр по бренду"),
     q: Optional[str] = Query(None, description="Поиск по названию (ILIKE)"),
     price_min: Optional[int] = Query(
         None, ge=0, description="Минимальная цена в центах"
@@ -76,6 +77,24 @@ def list_products(
         conditions.append(Product.price_cents >= price_min)
     if price_max is not None:
         conditions.append(Product.price_cents <= price_max)
+    
+    # Фильтр по бренду через атрибуты
+    brand_product_ids = None
+    if brand:
+        from app.db.models import ProductAttribute
+        brand_stmt = select(ProductAttribute.product_id).where(
+            and_(
+                ProductAttribute.attr_key == 'Бренд',
+                ProductAttribute.value == brand
+            )
+        )
+        brand_product_ids = set(db.scalars(brand_stmt).all())
+        if brand_product_ids:
+            conditions.append(Product.id.in_(brand_product_ids))
+        else:
+            # Если бренд не найден, возвращаем пустой результат
+            conditions.append(Product.id == None)
+    
     where_clause = and_(*conditions) if conditions else None
 
     # Подсчет общего количества (отдельно, без ORDER/LIMIT)
@@ -207,6 +226,38 @@ def list_products(
         "items": items,
         "meta": meta_data,
     }
+
+
+@router.get("/brands", response_model=list)
+def get_brands(
+    db: Session = Depends(get_db),
+    category_id: Optional[int] = Query(None, description="Фильтр по категории"),
+):
+    """
+    Получить список уникальных брендов.
+    
+    Возвращает список уникальных брендов из атрибутов товаров.
+    Опционально можно фильтровать по категории.
+    """
+    from app.db.models import ProductAttribute
+    
+    # Запрос для получения уникальных брендов
+    stmt = select(ProductAttribute.value).distinct().where(
+        ProductAttribute.attr_key == 'Бренд'
+    )
+    
+    # Фильтр по категории если указан
+    if category_id is not None:
+        from app.db.models import Product
+        stmt = stmt.join(Product).where(Product.category_id == category_id)
+    
+    brands = db.scalars(stmt).all()
+    
+    # Фильтруем и сортируем
+    filtered_brands = [b for b in brands if b and b.strip()]
+    filtered_brands.sort()
+    
+    return filtered_brands
 
 
 @router.get("/{product_id}", response_model=dict)
