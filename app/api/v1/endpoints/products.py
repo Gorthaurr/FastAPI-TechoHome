@@ -186,13 +186,8 @@ def list_products(
             # Загружаем только ключевые атрибуты для списка товаров
             from app.db.models import ProductAttribute
             attr_stmt = select(ProductAttribute).where(
-                and_(
-                    ProductAttribute.product_id == product.id,
-                    ProductAttribute.attr_key.in_([
-                        'brand', 'model', 'color', 'size', 'material', 'weight'
-                    ])  # Только основные атрибуты для списка
-                )
-            ).limit(5)  # Максимум 5 атрибутов
+                ProductAttribute.product_id == product.id
+            ).limit(10)  # Берем все основные атрибуты
             attributes = db.scalars(attr_stmt).all()
             item["attributes"] = [
                 {"id": attr.id, "key": attr.attr_key, "value": attr.value}
