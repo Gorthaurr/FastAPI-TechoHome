@@ -120,8 +120,7 @@ def list_products(
     # Применяем сортировку: сначала по наличию изображений, потом по основному полю
     stmt = stmt.order_by(has_images_order, main_order)
 
-    # Пагинация - с жестким лимитом для предотвращения медленных запросов
-    page_size = min(page_size, 20)  # Максимум 20 товаров на страницу
+    # Пагинация
     offset = (page - 1) * page_size
     rows = db.scalars(stmt.offset(offset).limit(page_size)).all()
 
