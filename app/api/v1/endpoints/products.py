@@ -26,7 +26,7 @@ SortField = Literal["name", "-name", "price", "-price"]
 def list_products(
     db: Session = Depends(get_db),
     page: int = Query(1, ge=1, description="Номер страницы"),
-    page_size: int = Query(20, ge=1, le=20, description="Размер страницы"),
+    page_size: int = Query(20, ge=1, le=100, description="Размер страницы"),
     category_id: Optional[int] = Query(None, description="Фильтр по категории"),
     q: Optional[str] = Query(None, description="Поиск по названию (ILIKE)"),
     price_min: Optional[int] = Query(
