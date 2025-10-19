@@ -29,6 +29,8 @@ def list_products(
     page_size: int = Query(20, ge=1, le=100, description="Размер страницы"),
     category_id: Optional[int] = Query(None, description="Фильтр по категории"),
     brand: Optional[str] = Query(None, description="Фильтр по бренду"),
+    brands: Optional[str] = Query(None, description="Фильтр по нескольким брендам (через запятую)"),
+    heating_types: Optional[str] = Query(None, description="Фильтр по типам нагрева (через запятую)"),
     q: Optional[str] = Query(None, description="Поиск по названию (ILIKE)"),
     price_min: Optional[int] = Query(
         None, ge=0, description="Минимальная цена в центах"
@@ -78,7 +80,7 @@ def list_products(
     if price_max is not None:
         conditions.append(Product.price_cents <= price_max)
     
-    # Фильтр по бренду через атрибуты
+    # Фильтр по брендам через атрибуты
     brand_product_ids = None
     if brand:
         from app.db.models import ProductAttribute
@@ -94,6 +96,45 @@ def list_products(
         else:
             # Если бренд не найден, возвращаем пустой результат
             conditions.append(Product.id == None)
+    
+    # Фильтр по нескольким брендам
+    if brands:
+        from app.db.models import ProductAttribute
+        brand_list = [b.strip() for b in brands.split(',') if b.strip()]
+        if brand_list:
+            brands_stmt = select(ProductAttribute.product_id).where(
+                and_(
+                    ProductAttribute.attr_key == 'Бренд',
+                    ProductAttribute.value.in_(brand_list)
+                )
+            )
+            brands_product_ids = set(db.scalars(brands_stmt).all())
+            if brands_product_ids:
+                conditions.append(Product.id.in_(brands_product_ids))
+            else:
+                # Если ни один бренд не найден, возвращаем пустой результат
+                conditions.append(Product.id == None)
+    
+    # Фильтр по типам нагрева
+    if heating_types:
+        from app.db.models import ProductAttribute
+        heating_list = [h.strip() for h in heating_types.split(',') if h.strip()]
+        if heating_list:
+            # Ищем атрибуты, связанные с типом нагрева
+            heating_stmt = select(ProductAttribute.product_id).where(
+                and_(
+                    ProductAttribute.attr_key.in_([
+                        'Тип нагрева', 'Нагрев', 'Тип', 'Type', 'Heating'
+                    ]),
+                    ProductAttribute.value.in_(heating_list)
+                )
+            )
+            heating_product_ids = set(db.scalars(heating_stmt).all())
+            if heating_product_ids:
+                conditions.append(Product.id.in_(heating_product_ids))
+            else:
+                # Если ни один тип нагрева не найден, возвращаем пустой результат
+                conditions.append(Product.id == None)
     
     where_clause = and_(*conditions) if conditions else None
 
@@ -258,6 +299,40 @@ def get_brands(
     filtered_brands.sort()
     
     return filtered_brands
+
+
+@router.get("/heating-types", response_model=list)
+def get_heating_types(
+    db: Session = Depends(get_db),
+    category_id: Optional[int] = Query(None, description="Фильтр по категории"),
+):
+    """
+    Получить список уникальных типов нагрева.
+    
+    Возвращает список уникальных типов нагрева из атрибутов товаров.
+    Опционально можно фильтровать по категории.
+    """
+    from app.db.models import ProductAttribute
+    
+    # Запрос для получения уникальных типов нагрева
+    stmt = select(ProductAttribute.value).distinct().where(
+        ProductAttribute.attr_key.in_([
+            'Тип нагрева', 'Нагрев', 'Тип', 'Type', 'Heating'
+        ])
+    )
+    
+    # Фильтр по категории если указан
+    if category_id is not None:
+        from app.db.models import Product
+        stmt = stmt.join(Product).where(Product.category_id == category_id)
+    
+    heating_types = db.scalars(stmt).all()
+    
+    # Фильтруем и сортируем
+    filtered_types = [t for t in heating_types if t and t.strip()]
+    filtered_types.sort()
+    
+    return filtered_types
 
 
 @router.get("/{product_id}", response_model=dict)
