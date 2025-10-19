@@ -79,10 +79,11 @@ def list_products(
     if price_max is not None:
         conditions.append(Product.price_cents <= price_max)
     
-    # Фильтр по бренду через атрибуты
+    # Фильтр по бренду через атрибуты (только в рамках категории)
     brand_product_ids = None
-    if brand:
+    if brand and category_id:
         from app.db.models import ProductAttribute
+        # Ищем товары с указанным брендом в рамках категории
         brand_stmt = select(ProductAttribute.product_id).where(
             and_(
                 ProductAttribute.attr_key == 'Бренд',
@@ -93,7 +94,7 @@ def list_products(
         if brand_product_ids:
             conditions.append(Product.id.in_(brand_product_ids))
         else:
-            # Если бренд не найден, возвращаем пустой результат
+            # Если бренд не найден в категории, возвращаем пустой результат
             conditions.append(Product.id == None)
     
     # Фильтр по типам нагрева (только для варочных панелей)
