@@ -120,25 +120,11 @@ def list_products(
         from app.db.models import ProductAttribute
         heating_list = [h.strip() for h in heating_types.split(',') if h.strip()]
         if heating_list:
-            # Расширяем список значений для поиска
-            expanded_heating_list = []
-            for heating_type in heating_list:
-                if heating_type == 'газовые':
-                    expanded_heating_list.extend(['газовые', 'газ', 'gas'])
-                elif heating_type == 'электрические':
-                    expanded_heating_list.extend(['электрические', 'электрические', 'electric'])
-                elif heating_type == 'индукционные':
-                    expanded_heating_list.extend(['индукционные', 'индукционные', 'induction'])
-                else:
-                    expanded_heating_list.append(heating_type)
-            
-            # Ищем атрибуты, связанные с типом нагрева
+            # Ищем товары с атрибутом "Тип панели"
             heating_stmt = select(ProductAttribute.product_id).where(
                 and_(
-                    ProductAttribute.attr_key.in_([
-                        'Тип панели', 'Тип нагрева', 'Нагрев', 'Тип', 'Type', 'Heating'
-                    ]),
-                    ProductAttribute.value.in_(expanded_heating_list)
+                    ProductAttribute.attr_key == 'Тип панели',
+                    ProductAttribute.value.in_(heating_list)
                 )
             )
             heating_product_ids = set(db.scalars(heating_stmt).all())
@@ -328,9 +314,7 @@ def get_heating_types(
     
     # Запрос для получения уникальных типов нагрева
     stmt = select(ProductAttribute.value).distinct().where(
-        ProductAttribute.attr_key.in_([
-            'Тип панели', 'Тип нагрева', 'Нагрев', 'Тип', 'Type', 'Heating'
-        ])
+        ProductAttribute.attr_key == 'Тип панели'
     )
     
     # Фильтр по категории если указан
