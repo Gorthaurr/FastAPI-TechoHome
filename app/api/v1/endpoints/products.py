@@ -96,22 +96,27 @@ def list_products(
             # Если бренд не найден, возвращаем пустой результат
             conditions.append(Product.id == None)
     
-    # Фильтр по типам нагрева
-    if heating_types:
-        from app.db.models import ProductAttribute
-        heating_list = [h.strip() for h in heating_types.split(',') if h.strip()]
-        if heating_list:
-            heating_stmt = select(ProductAttribute.product_id).where(
-                and_(
-                    ProductAttribute.attr_key == 'Тип панели',
-                    func.lower(ProductAttribute.value).in_([h.lower() for h in heating_list])
+    # Фильтр по типам нагрева (только для варочных панелей)
+    if heating_types and category_id:
+        from app.db.models import ProductAttribute, Category
+        # Проверяем, что это категория варочных панелей
+        category_stmt = select(Category.slug).where(Category.id == category_id)
+        category_slug = db.scalar(category_stmt)
+        
+        if category_slug == 'варочные-панели':
+            heating_list = [h.strip() for h in heating_types.split(',') if h.strip()]
+            if heating_list:
+                heating_stmt = select(ProductAttribute.product_id).where(
+                    and_(
+                        ProductAttribute.attr_key == 'Тип панели',
+                        func.lower(ProductAttribute.value).in_([h.lower() for h in heating_list])
+                    )
                 )
-            )
-            heating_product_ids = set(db.scalars(heating_stmt).all())
-            if heating_product_ids:
-                conditions.append(Product.id.in_(heating_product_ids))
-            else:
-                conditions.append(Product.id == None)
+                heating_product_ids = set(db.scalars(heating_stmt).all())
+                if heating_product_ids:
+                    conditions.append(Product.id.in_(heating_product_ids))
+                else:
+                    conditions.append(Product.id == None)
     
     where_clause = and_(*conditions) if conditions else None
 
